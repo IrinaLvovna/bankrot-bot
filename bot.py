@@ -355,7 +355,32 @@ def detail_years(text, title):
     return (extract_years(focus, first_only=True) if focus else []) or extract_years(text, first_only=True)
 
 
+# На странице лота есть служебные поля: «Код лота РАД-… Код процедуры … Регион <…> Адрес <…>».
+# Это данные самого лота; ниже на странице идут «похожие лоты» с чужими адресами.
+_FIELD_OWN_RE = re.compile(r"Код лота\s+\S+.{0,120}?\bРегион\s+(.{2,60}?)\s+Адрес\s+(.{0,160})")
+_FIELD_ANY_RE = re.compile(r"\bРегион\s+(.{2,60}?)\s+Адрес\s+(.{0,160})")
+
+
+def region_from_fields(text):
+    m = _FIELD_OWN_RE.search(text or "") or _FIELD_ANY_RE.search(text or "")
+    if not m:
+        return None
+    reg = m.group(1).lower().replace("ё", "е")
+    addr = m.group(2).lower().replace("ё", "е")
+    if "москв" in reg or "московск" in reg:
+        if "московск" in reg:
+            city = _MO_CITY_RE.search(addr)
+            label = f"Моск. обл., {city.group(1).title()}" if city else "Московская обл."
+        else:
+            label = "Москва"
+        return "msk", label, "поле «Регион»"
+    return "other", None, "поле «Регион»"
+
+
 def detail_region(text, title):
+    reg = region_from_fields(text)
+    if reg:
+        return reg
     focus = _focus(text, title, 3000)
     reg = detect_region(focus) if focus else (None, None, None)
     return reg if reg[0] else detect_region(text)
@@ -402,16 +427,19 @@ _ADDR_RE = re.compile(r"(местонахожд\w*|местоположен\w*|�
 
 
 def _classify(w):
-    msk = _MSK_RE.search(w)
-    if _SPB_RE.search(w) and not msk:
-        return "other"
-    if msk:
-        return "msk"
-    if _MO_CITY_RE.search(w) and not _OBL_RE.search(w):
-        return "msk"
-    if _OTHER_RE.search(w):
-        return "other"
-    return None
+    """Регион по первому упоминанию в тексте: дальше часто идут адреса соседних лотов."""
+    hits = []
+    for rx, kind in ((_MSK_RE, "msk"), (_SPB_RE, "other"), (_OTHER_RE, "other")):
+        m = rx.search(w)
+        if m:
+            hits.append((m.start(), 0 if kind == "msk" else 1, kind))
+    city = _MO_CITY_RE.search(w)
+    if city:
+        obl = _OBL_RE.search(w)
+        # Город из Подмосковья учитываем, если рядом не названа другая область (Троицк бывает и Челябинский)
+        if not obl or _MSK_RE.search(obl.group(0)):
+            hits.append((city.start(), 0, "msk"))
+    return min(hits)[2] if hits else None
 
 
 def _region_label(w):
