@@ -61,8 +61,10 @@ log = logging.getLogger("bankrot")
 # ─── Telegram ──────────────────────────────────────────
 
 def api_call(method, **kwargs):
+    # Пустые параметры не отправляем: Telegram отклоняет, например, parse_mode = null
+    payload = {k: v for k, v in kwargs.items() if v is not None}
     try:
-        r = requests.post(f"{API}/{method}", json=kwargs, timeout=30)
+        r = requests.post(f"{API}/{method}", json=payload, timeout=30)
         return r.json()
     except Exception as e:
         log.error(f"API {method}: {e}")
@@ -88,11 +90,15 @@ def send_message(cid, text, parse_mode="HTML"):
     for part in _split(text):
         res = api_call("sendMessage", chat_id=cid, text=part, parse_mode=parse_mode,
                        disable_web_page_preview=True)
-        if not res.get("ok") and parse_mode:
+        if res.get("ok"):
+            continue
+        log.warning(f"sendMessage to {cid} failed: {res.get('description')}")
+        if parse_mode:
             # Если Telegram не принял HTML — отправляем тем же текстом без разметки
-            log.warning(f"sendMessage HTML failed: {res.get('description')}; resend as plain text")
             plain = html.unescape(re.sub(r"<[^>]+>", "", part))
-            api_call("sendMessage", chat_id=cid, text=plain, disable_web_page_preview=True)
+            res = api_call("sendMessage", chat_id=cid, text=plain, disable_web_page_preview=True)
+            if not res.get("ok"):
+                log.error(f"sendMessage plain to {cid} failed: {res.get('description')}")
 
 
 def answer(cid, text):
@@ -379,8 +385,8 @@ _MSK_RE = re.compile(r"\bмосква\b|\bмосквы\b|\bмоскве\b|\bг\.
 _MO_CITY_RE = re.compile(r"(?:\bг\.?\s*о?\.?\s*|\bгород\w*\s+(?:округ\s+)?)(" +
                          "|".join(re.escape(c) for c in _MO_CITIES) + r")\b")
 _SPB_RE = re.compile(r"санкт-петербург|ленинградск\w*\s+обл|\bспб\b")
-_OBL_RE = re.compile(r"\b[а-я-]+(?:ская|цкая|ской|цкой)\s+обл")
-_OTHER_RE = re.compile(r"\b[а-я-]+(?:ская|цкая|ской|цкой)\s+обл|\bкра[йя]\b|\bреспублик|"
+_OBL_RE = re.compile(r"\b[а-я-]{1,40}(?:ская|цкая|ской|цкой)\s+обл")
+_OTHER_RE = re.compile(r"\b[а-я-]{1,40}(?:ская|цкая|ской|цкой)\s+обл|\bкра[йя]\b|\bреспублик|"
                        r"санкт-петербург|ленинградск|\bг\.\s*(?!москв)[а-я-]{3,}|"
                        r"\bгород\s+(?!москв)[а-я-]{3,}")
 # Упоминания, где адрес относится не к имуществу (суд, управляющий, регистрация должника и т.п.)
@@ -821,6 +827,7 @@ def cmd_debug(cid):
     out = ["🛠 ПРОВЕРКА ЧТЕНИЯ САЙТА\n"]
     for cat in (AUTO_CATS[:1] + REALTY_CATS[:1]):
         name = RAD_CATEGORIES.get(cat, (str(cat), 0))[0]
+        log.info(f"debug: категория {cat}")
         try:
             p1 = _parse_catalog_page(BeautifulSoup(_get(_category_url(cat, 1)).text, "lxml"), cat, name, 0)
             p2 = _parse_catalog_page(BeautifulSoup(_get(_category_url(cat, 2)).text, "lxml"), cat, name, 0)
@@ -857,6 +864,7 @@ def cmd_debug(cid):
             except Exception as e:
                 out.append(f" Карточка лота: ошибка — {e}")
         out.append("")
+    log.info(f"debug: отправляю отчёт ({sum(len(x) for x in out)} симв.)")
     send_message(cid, "\n".join(out), parse_mode=None)
 
 
