@@ -312,21 +312,47 @@ def fetch_detail_text(url):
 _DATE_RE = re.compile(r"\b\d{1,2}[./]\d{1,2}[./]\d{2,4}\b")
 _YEAR_RES = [
     re.compile(r"год\w*\s+(?:выпуска|изготовления)[^\d]{0,25}((?:19|20)\d\d)"),
-    re.compile(r"((?:19|20)\d\d)\s*(?:г\.?\s*в\b|года?\s+выпуска|г\.?\s+выпуска|года?\s+изготовления)"),
-    re.compile(r"\bг\.?\s*в\.?\s*[:\-–—]?\s*((?:19|20)\d\d)"),
+    # «2012 г.в.», «2012г.в», «2012 года выпуска» — но не «от 5 марта 2019 г. в отношении должника»
+    re.compile(r"((?:19|20)\d\d)\s*(?:г\.?\s?в\.|г\.?в\b|гв\b|года?\s+выпуска|г\.?\s+выпуска|"
+               r"года?\s+изготовления)"),
+    re.compile(r"\bг\.\s?в\.\s*[:\-–—]?\s*((?:19|20)\d\d)"),
 ]
 _BARE_YEAR_RE = re.compile(r"(?<![\w.,/-])((?:19[89]|20[0-3])\d)(?![\w])")
 
 
-def extract_years(text, allow_bare=False):
-    """Годы выпуска из текста. allow_bare — искать и «голый» год (только для названия лота)."""
+def extract_years(text, allow_bare=False, first_only=False):
+    """Годы выпуска из текста. allow_bare — искать и «голый» год (только для названия лота).
+    first_only — взять только первое упоминание (на странице лота дальше бывают другие лоты)."""
     t = _DATE_RE.sub(" ", (text or "").lower())
-    years = []
+    found = []
     for rx in _YEAR_RES:
-        years += [int(y) for y in rx.findall(t)]
-    if not years and allow_bare:
-        years = [int(y) for y in _BARE_YEAR_RE.findall(t)]
-    return sorted({y for y in years if 1980 <= y <= CUR_YEAR + 1})
+        found += [(m.start(), int(m.group(1))) for m in rx.finditer(t)]
+    if not found and allow_bare:
+        found = [(m.start(), int(m.group(1))) for m in _BARE_YEAR_RE.finditer(t)]
+    found = [(p, y) for p, y in found if 1980 <= y <= CUR_YEAR + 1]
+    if not found:
+        return []
+    if first_only:
+        return [min(found)[1]]
+    return sorted({y for _, y in found})
+
+
+def _focus(text, title, span):
+    """Фрагмент страницы лота, начиная с его собственного названия (если оно найдено)."""
+    key = re.sub(r"\s+", " ", (title or "").lower()).strip()[:40]
+    pos = text.lower().find(key) if len(key) >= 10 else -1
+    return text[pos: pos + span] if pos >= 0 else None
+
+
+def detail_years(text, title):
+    focus = _focus(text, title, 1500)
+    return (extract_years(focus, first_only=True) if focus else []) or extract_years(text, first_only=True)
+
+
+def detail_region(text, title):
+    focus = _focus(text, title, 3000)
+    reg = detect_region(focus) if focus else (None, None, None)
+    return reg if reg[0] else detect_region(text)
 
 
 def year_label(years):
@@ -366,7 +392,7 @@ _NOISE_RE = re.compile(
     r"абонентск\w*\s+ящик|e-?mail|тел\.|телефон\w*|заявк\w*)[^.;]{0,150}")
 _ABBR_RE = re.compile(r"\b(г|ул|д|обл|кв|пр|пл|п|с|ст|корп|стр|пос|мкр|им|о|пер|ш|наб|тер|уч|р|вл)\.")
 _ADDR_RE = re.compile(r"(местонахожд\w*|местоположен\w*|расположен\w*|по\s+адресу|"
-                      r"адрес\s+объекта|адрес\s+имущества|адрес\s*:)")
+                      r"адрес\s+объекта|адрес\s+имущества|адрес\s*:|регион\w*(?:\s+объекта)?\s*:)")
 
 
 def _classify(w):
@@ -399,13 +425,16 @@ def detect_region(text):
     t = (text or "").lower().replace("ё", "е")
     # Точки в сокращениях («г.», «ул.», «обл.») не считаем концом фразы при вырезании «шума»
     t = _ABBR_RE.sub(r"\1§", t)
-    t = _NOISE_RE.sub(" ", t).replace("§", ".")
-    windows = [t[m.end(): m.end() + 200] for m in _ADDR_RE.finditer(t)]
-    for w in windows:
-        if _classify(w) == "msk":
+    p = _NOISE_RE.sub(" ", t)          # здесь точки — только концы фраз
+    t = p.replace("§", ".")
+    # Берём первое адресное упоминание, по которому регион определяется однозначно.
+    # Адрес обрезаем по концу фразы, чтобы не захватить адрес соседнего лота.
+    for m in _ADDR_RE.finditer(p):
+        w = re.split(r"\.\s|;|\bлот\s*№?\s*\d", p[m.end(): m.end() + 200])[0].replace("§", ".")
+        v = _classify(w)
+        if v == "msk":
             return "msk", _region_label(w), "адрес"
-    for w in windows:
-        if _classify(w) == "other":
+        if v == "other":
             return "other", None, "адрес"
     v = _classify(t)
     if v == "msk":
@@ -445,7 +474,7 @@ def search_auto():
     def work(l):
         try:
             text, _ = fetch_detail_text(l["url"])
-            l["years"] = extract_years(text)
+            l["years"] = detail_years(text, l["title"])
         except Exception as e:
             log.error(f"Карточка {l['url']}: {e}")
             return
@@ -481,7 +510,7 @@ def search_realty():
         except Exception as e:
             log.error(f"Карточка {l['url']}: {e}")
             return
-        reg, label, src = detect_region(text)
+        reg, label, src = detail_region(text, l["title"])
         l["region"], l["region_label"], l["region_src"] = reg, label, src
         _region_cache[l["url"]] = (reg, label, src)
 
@@ -813,15 +842,22 @@ def cmd_debug(cid):
             probe = next((l for l in p1 if info(l).endswith("—")), p1[0])
             try:
                 text, src = fetch_detail_text(probe["url"])
-                reg = detect_region(text)
-                out.append(f" Открыт лот «{_short(probe['title'], 50)}»: текст {len(text)} симв. ({src}); "
-                           f"год: {year_label(extract_years(text)) or '—'}; "
-                           f"регион: {reg[1] or reg[0] or '—'} (по: {reg[2] or '—'})")
-                out.append(f" Начало текста: {_short(text, 300)}")
+                focus = _focus(text, probe["title"], 3000)
+                if cat in AUTO_CATS:
+                    result = f"год: {year_label(detail_years(text, probe['title'])) or '—'}"
+                    snip_re = r"год\w*\s+выпуска|\d{4}\s*г\.?\s?в\."
+                else:
+                    reg = detail_region(text, probe["title"])
+                    result = f"регион: {reg[1] or reg[0] or '—'} (по: {reg[2] or '—'})"
+                    snip_re = r"регион|местонахожд|местоположен|по адресу|адрес объекта"
+                out.append(f" Открыт лот «{_short(probe['title'], 60)}»: текст {len(text)} симв. ({src}), "
+                           f"название на странице {'найдено' if focus else 'не найдено'}; {result}")
+                for m in list(re.finditer(snip_re, text, re.I))[:4]:
+                    out.append(f"   …{text[max(0, m.start() - 60): m.end() + 90]}…")
             except Exception as e:
                 out.append(f" Карточка лота: ошибка — {e}")
         out.append("")
-    api_call("sendMessage", chat_id=cid, text="\n".join(out)[:4000], disable_web_page_preview=True)
+    send_message(cid, "\n".join(out), parse_mode=None)
 
 
 def handle_command(cid, text, user):
