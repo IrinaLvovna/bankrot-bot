@@ -15,7 +15,7 @@ from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from zoneinfo import ZoneInfo
 from flask import Flask, request as flask_request
-from bs4 import BeautifulSoup
+from lxml import etree, html as LH
 from market_price import search_market_prices, calculate_margin, search_drom
 from llm_analyzer import llm_analyze_lot, llm_compare_lots, is_available as llm_available
 
@@ -51,6 +51,9 @@ ITEMS_PER_PAGE = _env_int("ITEMS_PER_PAGE", 96)
 MAX_DETAIL_FETCH = _env_int("MAX_DETAIL_FETCH", 150)    # сколько карточек лотов открывать за поиск
 TOP_N = _env_int("TOP_N", 15)                           # сколько лотов показывать
 DAILY_DIGEST = os.getenv("DAILY_DIGEST", "auto,realty") # что присылать утром
+# Какие лоты недвижимости убирать: lease — право аренды, share — доли в праве,
+# claim — права требования/дебиторка, storage — кладовые и хозблоки
+REALTY_EXCLUDE = {x.strip() for x in os.getenv("REALTY_EXCLUDE", "lease,share,claim").split(",") if x.strip()}
 
 CUR_YEAR = datetime.now().year
 
@@ -186,18 +189,35 @@ def parse_price(text):
     return float(num) if num else 0.0
 
 
-def _parse_catalog_page(soup, cat_id, cat_name, cat_margin):
+def _doc(page_html):
+    """HTML -> дерево lxml (в разы быстрее BeautifulSoup — важно на слабом сервере Render)."""
+    page_html = re.sub(r"^\s*<\?xml[^>]*\?>", "", page_html or "") or "<html></html>"
+    doc = LH.document_fromstring(page_html)
+    etree.strip_elements(doc, etree.Comment, "script", "style", "noscript", "svg", with_tail=False)
+    return doc
+
+
+def _cls(name, rel=False):
+    return f"{'.' if rel else ''}//*[contains(concat(' ', normalize-space(@class), ' '), ' {name} ')]"
+
+
+def _txt(node):
+    return re.sub(r"\s+", " ", " ".join(node.itertext())).strip()
+
+
+def _parse_catalog_page(page_html, cat_id, cat_name, cat_margin):
     """Карточки лотов со страницы каталога lot-online.ru."""
+    doc = _doc(page_html)
     lots = []
-    cards = soup.select(".ty-grid-list__item") or soup.select(".ty-compact-list__item") \
-        or soup.select(".ty-product-list")
+    cards = doc.xpath(_cls("ty-grid-list__item")) or doc.xpath(_cls("ty-compact-list__item")) \
+        or doc.xpath(_cls("ty-product-list"))
 
     for card in cards:
         title, url = "", ""
-        for a in card.find_all("a", href=True):
+        for a in card.xpath(".//a[@href]"):
             href = a.get("href", "")
             if "product_id" in href or "products.view" in href:
-                text = a.get_text(" ", strip=True)
+                text = _txt(a)
                 if text and len(text) > len(title):
                     title = text
                     pid_m = re.search(r"product_id=(\d+)", href)
@@ -207,19 +227,20 @@ def _parse_catalog_page(soup, cat_id, cat_name, cat_margin):
             continue
 
         price = 0.0
-        price_el = card.select_one(".ty-price")
+        price_el = card.xpath(_cls("ty-price", rel=True))
         if price_el:
-            price = parse_price(price_el.get_text(" ", strip=True))
+            price = parse_price(_txt(price_el[0]))
         if price <= 0:
-            for txt in card.find_all(string=re.compile(r"\d[\d\s\xa0]{3,}")):
-                val = parse_price(txt)
-                if val > 999:
-                    price = val
-                    break
+            for chunk in card.itertext():
+                if re.search(r"\d[\d\s\xa0]{3,}", chunk):
+                    val = parse_price(chunk)
+                    if val > 999:
+                        price = val
+                        break
         if price <= 0:
             continue
 
-        card_text = re.sub(r"\s+", " ", card.get_text(" ", strip=True))
+        card_text = _txt(card)
         date_end = ""
         days_match = re.search(r"Торги через (\d+) дн", card_text)
         if days_match:
@@ -239,7 +260,27 @@ def _parse_catalog_page(soup, cat_id, cat_name, cat_margin):
     return lots
 
 
-def fetch_category(cat_id, max_pages=None):
+def _noop(*a, **k):
+    pass
+
+
+class Progress:
+    """Одно сообщение в Telegram, которое обновляется по ходу поиска."""
+
+    def __init__(self, cid, head):
+        self.cid, self.head, self.last = cid, head, 0.0
+        res = api_call("sendMessage", chat_id=cid, text=head)
+        self.mid = (res.get("result") or {}).get("message_id")
+
+    def __call__(self, line, force=False):
+        now = time.time()
+        if not self.mid or (not force and now - self.last < 4):
+            return
+        self.last = now
+        api_call("editMessageText", chat_id=self.cid, message_id=self.mid, text=f"{self.head}\n\n{line}")
+
+
+def fetch_category(cat_id, max_pages=None, progress=_noop):
     """Все лоты категории: листаем страницы, пока появляются новые."""
     cat_name, cat_margin = RAD_CATEGORIES.get(cat_id, (f"Категория {cat_id}", 40))
     lots, seen = [], set()
@@ -249,20 +290,21 @@ def fetch_category(cat_id, max_pages=None):
         except Exception as e:
             log.error(f"  {cat_name} стр.{page}: {e}")
             break
-        page_lots = _parse_catalog_page(BeautifulSoup(r.text, "lxml"), cat_id, cat_name, cat_margin)
+        page_lots = _parse_catalog_page(r.text, cat_id, cat_name, cat_margin)
         new = [l for l in page_lots if l["url"] not in seen]
         seen.update(l["url"] for l in new)
         lots.extend(new)
         log.info(f"  {cat_name} стр.{page}: на странице {len(page_lots)}, новых {len(new)}")
+        progress(f"{cat_name}: страница {page}, лотов {len(lots)}")
         if not new:
             break
     return lots
 
 
-def gather(cat_ids):
+def gather(cat_ids, progress=_noop):
     lots, seen = [], set()
     for cid in cat_ids:
-        for l in fetch_category(cid):
+        for l in fetch_category(cid, progress=progress):
             if l["url"] not in seen:
                 seen.add(l["url"])
                 lots.append(l)
@@ -284,34 +326,31 @@ def fetch_rad_by_keyword(keyword):
            f"&q={requests.utils.quote(keyword)}&items_per_page={ITEMS_PER_PAGE}")
     try:
         r = _get(url)
-        return _parse_catalog_page(BeautifulSoup(r.text, "lxml"), 0, f"Поиск: {keyword}", 50)
+        return _parse_catalog_page(r.text, 0, f"Поиск: {keyword}", 50)
     except Exception as e:
         log.error(f"RAD search '{keyword}': {e}")
         return []
 
 
-_DETAIL_SELECTORS = [".ty-product-block", "#content_description", "#content_features",
-                     ".ty-product-block__description", ".ty-tabs__content"]
-
-
 def fetch_detail_text(url):
     """Текст карточки лота без шапки и подвала сайта. Возвращает (текст, откуда взят)."""
-    soup = BeautifulSoup(_get(url).text, "lxml")
-    for t in soup(["script", "style", "noscript"]):
-        t.decompose()
+    doc = _doc(_get(url).text)
+    nodes = (doc.xpath(_cls("ty-product-block")) + doc.xpath("//*[@id='content_description']")
+             + doc.xpath("//*[@id='content_features']") + doc.xpath(_cls("ty-product-block__description"))
+             + doc.xpath(_cls("ty-tabs__content")))
     texts = []
-    for sel in _DETAIL_SELECTORS:
-        for node in soup.select(sel):
-            t = node.get_text(" ", strip=True)
-            if t and t not in texts:
-                texts.append(t)
+    for node in nodes:
+        t = _txt(node)
+        if t and t not in texts:
+            texts.append(t)
     text, source = " ".join(texts), "блок лота"
     if len(text) < 200:
-        node = soup.select_one(".tygh-content") or soup.body or soup
-        for t in node.select(".tygh-header, .tygh-footer, header, footer, nav"):
-            t.decompose()
-        text, source = node.get_text(" ", strip=True), "вся страница"
-    return re.sub(r"\s+", " ", text), source
+        cont = doc.xpath(_cls("tygh-content")) or doc.xpath("//body") or [doc]
+        node = cont[0]
+        for bad in node.xpath(f"{_cls('tygh-header', True)}|{_cls('tygh-footer', True)}|.//header|.//footer|.//nav"):
+            bad.drop_tree()
+        text, source = _txt(node), "вся страница"
+    return text, source
 
 # ─── Год выпуска ───────────────────────────────────────
 
@@ -444,11 +483,11 @@ def _classify(w):
 
 def _region_label(w):
     city = _MO_CITY_RE.search(w)
+    if "зеленоград" in w:
+        return "Москва (Зеленоград)"
     if re.search(r"\bмосква\b|\bмосквы\b|\bмоскве\b|\bг\.?\s*москв|новая\s+москва", w) \
             and not re.search(r"московск\w*\s+обл", w):
         return "Москва"
-    if "зеленоград" in w:
-        return "Москва (Зеленоград)"
     if city:
         return f"Моск. обл., {city.group(1).title()}"
     return "Московская обл."
@@ -475,6 +514,29 @@ def detect_region(text):
         return "msk", _region_label(t), "текст"
     return v, None, ("текст" if v else None)
 
+# ─── Исключения для недвижимости ──────────────────────
+
+_LOT_PREFIX = r"^(?:лот\s*№?\s*\d+\s*[,.:;-]?\s*)?"
+_EXCLUDE_RULES = {
+    # «Право аренды нежилого помещения…» — но не «Жилой дом и право аренды земельного участка»
+    "lease": ("право аренды", re.compile(_LOT_PREFIX + r"(?:прав[оа]|уступк\w*\s+прав\w*)\s+(?:\w+\s+){0,2}аренд")),
+    # «Доля в праве 1/18…», «1/2 доли в праве на квартиру», «…(1/3 доли)»
+    "share": ("доли в праве", re.compile(_LOT_PREFIX + r"дол[яиюе]\b|\d+\s*/\s*\d+\s*(?:дол|доли)|"
+                                          r"\bдол[яиюе]\s+(?:в\s+праве|в\s+общей|в\s+размере)")),
+    "claim": ("права требования", re.compile(r"прав[оа]\s+(?:\w+\s+){0,2}требовани|дебиторск\w*\s+задолж|"
+                                             r"уступк\w*\s+прав\w*\s+требовани")),
+    "storage": ("кладовые", re.compile(r"кладов|хозблок|хозяйственн\w*\s+блок")),
+}
+
+
+def excluded_reason(title):
+    t = re.sub(r"\s+", " ", (title or "").lower().replace("ё", "е")).strip()
+    for key in REALTY_EXCLUDE:
+        rule = _EXCLUDE_RULES.get(key)
+        if rule and rule[1].search(t):
+            return rule[0]
+    return None
+
 # ─── Поиск авто и недвижимости ─────────────────────────
 
 _year_cache = {}     # url -> список годов из карточки лота
@@ -485,16 +547,25 @@ def _price_ok(l):
     return MIN_PRICE <= l["price"] <= MAX_PRICE
 
 
-def _fetch_details(lots, worker):
+def _fetch_details(lots, worker, progress=_noop, what="карточки лотов"):
     lots = lots[:MAX_DETAIL_FETCH]
+    done, lock = [0], threading.Lock()
+
+    def run(l):
+        worker(l)
+        with lock:
+            done[0] += 1
+            n = done[0]
+        progress(f"Открываю {what}: {n} из {len(lots)}")
+
     if lots:
         with ThreadPoolExecutor(max_workers=4) as ex:
-            list(ex.map(worker, lots))
+            list(ex.map(run, lots))
     return len(lots)
 
 
-def search_auto():
-    all_lots = gather(AUTO_CATS)
+def search_auto(progress=_noop):
+    all_lots = gather(AUTO_CATS, progress)
     lots = [l for l in all_lots if _price_ok(l)]
     need = []
     for l in lots:
@@ -514,7 +585,7 @@ def search_auto():
             return
         _year_cache[l["url"]] = l["years"]
 
-    opened = _fetch_details(need, work)
+    opened = _fetch_details(need, work, progress, "лоты без года в названии")
     found = [l for l in lots if l["years"] and l["years"][-1] >= AUTO_MIN_YEAR]
     found.sort(key=lambda l: l["price"])
     stats = {"total": len(all_lots), "in_price": len(lots), "opened": opened,
@@ -523,9 +594,16 @@ def search_auto():
     return found, stats
 
 
-def search_realty():
-    all_lots = gather(REALTY_CATS)
-    lots = [l for l in all_lots if _price_ok(l)]
+def search_realty(progress=_noop):
+    all_lots = gather(REALTY_CATS, progress)
+    in_price = [l for l in all_lots if _price_ok(l)]
+    lots, excluded = [], {}
+    for l in in_price:
+        why = excluded_reason(l["title"])
+        if why:
+            excluded[why] = excluded.get(why, 0) + 1
+        else:
+            lots.append(l)
     need = []
     for l in lots:
         if l["url"] in _region_cache:
@@ -548,12 +626,13 @@ def search_realty():
         l["region"], l["region_label"], l["region_src"] = reg, label, src
         _region_cache[l["url"]] = (reg, label, src)
 
-    opened = _fetch_details(need, work)
+    opened = _fetch_details(need, work, progress, "лоты без адреса в названии")
     found = [l for l in lots if l.get("region") == "msk"]
     found.sort(key=lambda l: l["price"])
-    stats = {"total": len(all_lots), "in_price": len(lots), "opened": opened,
+    stats = {"total": len(all_lots), "in_price": len(in_price), "opened": opened,
              "not_opened": max(0, len(need) - opened),
-             "unknown": sum(1 for l in lots if not l.get("region"))}
+             "unknown": sum(1 for l in lots if not l.get("region")),
+             "excluded": excluded}
     return found, stats
 
 
@@ -622,6 +701,8 @@ def fmt_realty(lots, stats):
         body = "\n" + "\n".join(fmt_simple(l, i, "realty") for i, l in enumerate(lots[:TOP_N], 1))
     foot = (f"\nПросмотрено лотов: {stats['total']}, по цене подошло: {stats['in_price']}, "
             f"регион не определён: {stats['unknown']}")
+    if stats.get("excluded"):
+        foot += "\nИсключено: " + ", ".join(f"{k} — {v}" for k, v in stats["excluded"].items())
     if stats["not_opened"]:
         foot += f", не проверено (лимит): {stats['not_opened']}"
     if len(lots) > TOP_N:
@@ -771,23 +852,30 @@ HELP_TEXT = (
     "/scan слово — поиск по слову\n"
     "/categories — список категорий\n"
     "/debug — проверка чтения сайта\n\n"
-    "Поиск занимает 1–4 минуты.\n"
+    "Поиск занимает несколько минут, ход виден в сообщении бота.\n"
     f"Утренняя рассылка: {DAILY_HOUR:02d}:{DAILY_MINUTE:02d} МСК"
 )
 
 
 def cmd_auto(cid):
-    send_message(cid, f"🚗 Ищу авто от {AUTO_MIN_YEAR} г.в. до {rub(MAX_PRICE)}… 1–3 минуты.")
-    lots, stats = search_auto()
+    t0 = time.time()
+    progress = Progress(cid, f"🚗 Ищу авто от {AUTO_MIN_YEAR} г.в. до {rub(MAX_PRICE)}. "
+                            "Это может занять несколько минут — ход поиска ниже.")
+    lots, stats = search_auto(progress)
+    progress("Сравниваю с объявлениями drom.ru…", force=True)
     add_drom_prices(lots)
     LAST_LOTS[cid] = lots
+    progress(f"✅ Готово за {int(time.time() - t0) // 60} мин {int(time.time() - t0) % 60} с", force=True)
     send_message(cid, fmt_auto(lots, stats))
 
 
 def cmd_realty(cid):
-    send_message(cid, f"🏠 Ищу недвижимость в Москве и МО до {rub(MAX_PRICE)}… 1–4 минуты.")
-    lots, stats = search_realty()
+    t0 = time.time()
+    progress = Progress(cid, f"🏠 Ищу недвижимость в Москве и МО до {rub(MAX_PRICE)}. "
+                            "Это может занять несколько минут — ход поиска ниже.")
+    lots, stats = search_realty(progress)
     LAST_LOTS[cid] = lots
+    progress(f"✅ Готово за {int(time.time() - t0) // 60} мин {int(time.time() - t0) % 60} с", force=True)
     send_message(cid, fmt_realty(lots, stats))
 
 
@@ -857,8 +945,8 @@ def cmd_debug(cid):
         name = RAD_CATEGORIES.get(cat, (str(cat), 0))[0]
         log.info(f"debug: категория {cat}")
         try:
-            p1 = _parse_catalog_page(BeautifulSoup(_get(_category_url(cat, 1)).text, "lxml"), cat, name, 0)
-            p2 = _parse_catalog_page(BeautifulSoup(_get(_category_url(cat, 2)).text, "lxml"), cat, name, 0)
+            p1 = _parse_catalog_page(_get(_category_url(cat, 1)).text, cat, name, 0)
+            p2 = _parse_catalog_page(_get(_category_url(cat, 2)).text, cat, name, 0)
         except Exception as e:
             out.append(f"{name}: ошибка загрузки — {e}\n")
             continue
