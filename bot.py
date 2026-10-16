@@ -53,6 +53,7 @@ TOP_N = _env_int("TOP_N", 15)                           # сколько лот�
 DAILY_DIGEST = os.getenv("DAILY_DIGEST", "auto,realty") # что присылать утром
 # Какие лоты недвижимости убирать: lease — право аренды, share — доли в праве,
 # claim — права требования/дебиторка, storage — кладовые и хозблоки
+SORT_DEFAULT = os.getenv("SORT_DEFAULT", "price")        # price — по цене, new — сначала новые
 REALTY_EXCLUDE = {x.strip() for x in os.getenv("REALTY_EXCLUDE", "lease,share,claim").split(",") if x.strip()}
 
 CUR_YEAR = datetime.now().year
@@ -255,6 +256,7 @@ def _parse_catalog_page(page_html, cat_id, cat_name, cat_margin):
             "cat_name": cat_name,
             "cat_margin": cat_margin,
             "date_end": date_end,
+            "code": int(code_m.group(1)) if (code_m := re.search(r"РАД-(\d+)", card_text)) else 0,
             "source": "lot-online.ru (РАД)",
         })
     return lots
@@ -287,6 +289,12 @@ def fetch_category(cat_id, max_pages=None, progress=_noop):
     for page in range(1, (max_pages or MAX_PAGES) + 1):
         try:
             r = _get(_category_url(cat_id, page))
+        except requests.HTTPError as e:
+            if page > 1 and e.response is not None and e.response.status_code == 404:
+                log.info(f"  {cat_name}: страницы закончились на {page - 1}")
+            else:
+                log.error(f"  {cat_name} стр.{page}: {e}")
+            break
         except Exception as e:
             log.error(f"  {cat_name} стр.{page}: {e}")
             break
@@ -514,6 +522,62 @@ def detect_region(text):
         return "msk", _region_label(t), "текст"
     return v, None, ("текст" if v else None)
 
+# ─── Дата публикации ──────────────────────────────────
+
+_PUB_RE = re.compile(r"[Нн]а lot-online\.ru:?\s*(\d{2})\.(\d{2})\.(\d{4})(?:\s+(\d{1,2}):(\d{2}))?")
+_pub_cache = {}   # url -> (дата «дд.мм.гггг», ключ для сортировки)
+
+
+def extract_pub_date(text):
+    m = _PUB_RE.search(text or "")
+    if not m:
+        return None
+    d, mo, y, h, mi = m.groups()
+    return f"{d}.{mo}.{y}", (int(y), int(mo), int(d), int(h or 0), int(mi or 0))
+
+
+def remember_pub(l, text):
+    pub = extract_pub_date(text)
+    if pub:
+        l["published"], l["pub_key"] = pub
+        _pub_cache[l["url"]] = pub
+
+
+def parse_sort(args):
+    a = " ".join(args).lower()
+    if any(w in a for w in ("нов", "дат", "свеж", "new")):
+        return "new"
+    if any(w in a for w in ("цен", "дешев", "дёшев", "price")):
+        return "price"
+    return "new" if SORT_DEFAULT.lower().startswith("new") else "price"
+
+
+def order_lots(found, sort, progress=_noop):
+    """Сортировка и даты публикации для показываемых лотов."""
+    if sort == "new":
+        # Номер лота РАД растёт со временем — по нему находим самые свежие
+        found.sort(key=lambda l: (-(l.get("code") or 0), l["price"]))
+    else:
+        found.sort(key=lambda l: l["price"])
+    top = found[:TOP_N]
+    for l in top:
+        if not l.get("published") and l["url"] in _pub_cache:
+            l["published"], l["pub_key"] = _pub_cache[l["url"]]
+    need = [l for l in top if not l.get("published")]
+
+    def work(l):
+        try:
+            text, _ = fetch_detail_text(l["url"])
+            remember_pub(l, text)
+        except Exception as e:
+            log.error(f"Дата публикации {l['url']}: {e}")
+
+    _fetch_details(need, work, progress, "даты публикации")
+    if sort == "new":
+        top.sort(key=lambda l: (l.get("pub_key") or (0,), l.get("code") or 0), reverse=True)
+        found[:TOP_N] = top
+    return found
+
 # ─── Исключения для недвижимости ──────────────────────
 
 _LOT_PREFIX = r"^(?:лот\s*№?\s*\d+\s*[,.:;-]?\s*)?"
@@ -564,7 +628,7 @@ def _fetch_details(lots, worker, progress=_noop, what="карточки лото
     return len(lots)
 
 
-def search_auto(progress=_noop):
+def search_auto(progress=_noop, sort="price"):
     all_lots = gather(AUTO_CATS, progress)
     lots = [l for l in all_lots if _price_ok(l)]
     need = []
@@ -580,6 +644,7 @@ def search_auto(progress=_noop):
         try:
             text, _ = fetch_detail_text(l["url"])
             l["years"] = detail_years(text, l["title"])
+            remember_pub(l, text)
         except Exception as e:
             log.error(f"Карточка {l['url']}: {e}")
             return
@@ -587,14 +652,14 @@ def search_auto(progress=_noop):
 
     opened = _fetch_details(need, work, progress, "лоты без года в названии")
     found = [l for l in lots if l["years"] and l["years"][-1] >= AUTO_MIN_YEAR]
-    found.sort(key=lambda l: l["price"])
+    order_lots(found, sort, progress)
     stats = {"total": len(all_lots), "in_price": len(lots), "opened": opened,
              "not_opened": max(0, len(need) - opened),
              "no_year": sum(1 for l in lots if not l["years"])}
     return found, stats
 
 
-def search_realty(progress=_noop):
+def search_realty(progress=_noop, sort="price"):
     all_lots = gather(REALTY_CATS, progress)
     in_price = [l for l in all_lots if _price_ok(l)]
     lots, excluded = [], {}
@@ -624,11 +689,12 @@ def search_realty(progress=_noop):
             return
         reg, label, src = detail_region(text, l["title"])
         l["region"], l["region_label"], l["region_src"] = reg, label, src
+        remember_pub(l, text)
         _region_cache[l["url"]] = (reg, label, src)
 
     opened = _fetch_details(need, work, progress, "лоты без адреса в названии")
     found = [l for l in lots if l.get("region") == "msk"]
-    found.sort(key=lambda l: l["price"])
+    order_lots(found, sort, progress)
     stats = {"total": len(all_lots), "in_price": len(in_price), "opened": opened,
              "not_opened": max(0, len(need) - opened),
              "unknown": sum(1 for l in lots if not l.get("region")),
@@ -665,6 +731,8 @@ def fmt_simple(lot, i, kind):
                 label += " (по тексту лота — проверьте адрес)"
             parts.append(f"📍 {esc(label)}")
         parts.append(esc(re.sub(r"^\W+\s*", "", lot.get("cat_name", ""))))
+    if lot.get("published"):
+        parts.append(f"📢 опубл. {lot['published']}")
     if lot.get("date_end"):
         parts.append(f"⏳ торги {lot['date_end']}")
     msg = f"<b>{i}. {esc(_short(lot['title']))}</b>\n" + " · ".join(parts) + "\n"
@@ -676,9 +744,13 @@ def fmt_simple(lot, i, kind):
     return msg
 
 
-def fmt_auto(lots, stats):
+def _sort_label(sort):
+    return "сначала новые" if sort == "new" else "отсортировано по цене"
+
+
+def fmt_auto(lots, stats, sort="price"):
     head = (f"🚗 <b>Авто от {AUTO_MIN_YEAR} г.в., до {rub(MAX_PRICE)}</b>\n"
-            f"Найдено: <b>{len(lots)}</b> · отсортировано по цене\n")
+            f"Найдено: <b>{len(lots)}</b> · {_sort_label(sort)}\n")
     if not lots:
         body = "\nПодходящих лотов сейчас нет.\n"
     else:
@@ -692,19 +764,19 @@ def fmt_auto(lots, stats):
     return head + body + foot + "\n💡 /analyze N — подробнее о лоте N из последнего списка"
 
 
-def fmt_realty(lots, stats):
+def fmt_realty(lots, stats, sort="price"):
     head = (f"🏠 <b>Недвижимость: Москва и Московская обл., до {rub(MAX_PRICE)}</b>\n"
-            f"Найдено: <b>{len(lots)}</b> · отсортировано по цене\n")
+            f"Найдено: <b>{len(lots)}</b> · {_sort_label(sort)}\n")
     if not lots:
         body = "\nПодходящих лотов сейчас нет.\n"
     else:
         body = "\n" + "\n".join(fmt_simple(l, i, "realty") for i, l in enumerate(lots[:TOP_N], 1))
     foot = (f"\nПросмотрено лотов: {stats['total']}, по цене подошло: {stats['in_price']}, "
             f"регион не определён: {stats['unknown']}")
-    if stats.get("excluded"):
-        foot += "\nИсключено: " + ", ".join(f"{k} — {v}" for k, v in stats["excluded"].items())
     if stats["not_opened"]:
         foot += f", не проверено (лимит): {stats['not_opened']}"
+    if stats.get("excluded"):
+        foot += "\nИсключено: " + ", ".join(f"{k} — {v}" for k, v in stats["excluded"].items())
     if len(lots) > TOP_N:
         foot += f"\nПоказаны первые {TOP_N} из {len(lots)}."
     return head + body + foot + "\n💡 /analyze N — подробнее о лоте N из последнего списка"
@@ -847,6 +919,8 @@ HELP_TEXT = (
     "<b>Бот банкротских торгов (РАД, lot-online.ru)</b>\n\n"
     f"/auto — легковые авто от {AUTO_MIN_YEAR} г.в., до {rub(MAX_PRICE)}\n"
     f"/realty — недвижимость в Москве и МО, до {rub(MAX_PRICE)}\n"
+    "/auto новые, /realty новые — сначала свежие лоты\n"
+    "/auto цена, /realty цена — сначала дешёвые\n"
     "/analyze 3 — подробнее о лоте №3 из последнего списка\n"
     "/scan — общий поиск по всем категориям\n"
     "/scan слово — поиск по слову\n"
@@ -857,26 +931,28 @@ HELP_TEXT = (
 )
 
 
-def cmd_auto(cid):
+def cmd_auto(cid, args=()):
+    sort = parse_sort(args)
     t0 = time.time()
     progress = Progress(cid, f"🚗 Ищу авто от {AUTO_MIN_YEAR} г.в. до {rub(MAX_PRICE)}. "
                             "Это может занять несколько минут — ход поиска ниже.")
-    lots, stats = search_auto(progress)
+    lots, stats = search_auto(progress, sort)
     progress("Сравниваю с объявлениями drom.ru…", force=True)
     add_drom_prices(lots)
     LAST_LOTS[cid] = lots
     progress(f"✅ Готово за {int(time.time() - t0) // 60} мин {int(time.time() - t0) % 60} с", force=True)
-    send_message(cid, fmt_auto(lots, stats))
+    send_message(cid, fmt_auto(lots, stats, sort))
 
 
-def cmd_realty(cid):
+def cmd_realty(cid, args=()):
+    sort = parse_sort(args)
     t0 = time.time()
     progress = Progress(cid, f"🏠 Ищу недвижимость в Москве и МО до {rub(MAX_PRICE)}. "
                             "Это может занять несколько минут — ход поиска ниже.")
-    lots, stats = search_realty(progress)
+    lots, stats = search_realty(progress, sort)
     LAST_LOTS[cid] = lots
     progress(f"✅ Готово за {int(time.time() - t0) // 60} мин {int(time.time() - t0) % 60} с", force=True)
-    send_message(cid, fmt_realty(lots, stats))
+    send_message(cid, fmt_realty(lots, stats, sort))
 
 
 def cmd_scan(cid, keyword):
@@ -998,9 +1074,9 @@ def handle_command(cid, text, user):
         lines.append(f"\nАвто: {AUTO_CATS} · Недвижимость: {REALTY_CATS}")
         answer(cid, "\n".join(lines))
     elif cmd == "/auto":
-        run_exclusive(cid, lambda: cmd_auto(cid))
+        run_exclusive(cid, lambda: cmd_auto(cid, args))
     elif cmd == "/realty":
-        run_exclusive(cid, lambda: cmd_realty(cid))
+        run_exclusive(cid, lambda: cmd_realty(cid, args))
     elif cmd == "/scan":
         run_exclusive(cid, lambda: cmd_scan(cid, " ".join(args) or None))
     elif cmd == "/analyze":
@@ -1018,12 +1094,14 @@ def do_daily():
     messages = []
     try:
         if "auto" in kinds:
-            lots, stats = search_auto()
+            sort = parse_sort([])
+            lots, stats = search_auto(sort=sort)
             add_drom_prices(lots)
-            messages.append(("auto", lots, fmt_auto(lots, stats)))
+            messages.append(("auto", lots, fmt_auto(lots, stats, sort)))
         if "realty" in kinds:
-            lots, stats = search_realty()
-            messages.append(("realty", lots, fmt_realty(lots, stats)))
+            sort = parse_sort([])
+            lots, stats = search_realty(sort=sort)
+            messages.append(("realty", lots, fmt_realty(lots, stats, sort)))
     except Exception as e:
         log.error(f"Daily error: {e}", exc_info=True)
     for cid in load_chat_ids():
