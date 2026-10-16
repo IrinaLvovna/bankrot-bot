@@ -1225,6 +1225,26 @@ def describe_query(q):
     return ", ".join(parts)
 
 
+def pub_dates_needed(lots):
+    """Лоты, для которых нужно открыть страницу ради даты публикации (только РАД и МЭТС;
+    у остальных площадок есть дата начала приёма заявок)."""
+    for l in lots:
+        if not l.get("published") and l["url"] in _pub_cache:
+            l["published"], l["pub_key"] = _pub_cache[l["url"]]
+    return [l for l in lots if not l.get("published") and l.get("src", "rad") in ("rad", "mets")]
+
+
+def add_pub_dates(lots, progress=_noop):
+    def work(l):
+        try:
+            text, _ = fetch_detail_text(l["url"])
+            remember_pub(l, text)
+        except Exception as e:
+            log.error(f"Дата публикации {l['url']}: {e}")
+
+    _fetch_details(pub_dates_needed(lots), work, progress, "даты публикации")
+
+
 def order_lots(found, sort, progress=_noop):
     """Сортировка и даты публикации для показываемых лотов."""
     if sort == "new":
@@ -1240,20 +1260,7 @@ def order_lots(found, sort, progress=_noop):
     else:
         found.sort(key=lambda l: l["price"])
         top, rest = found[:TOP_N], found[TOP_N:]
-    for l in top:
-        if not l.get("published") and l["url"] in _pub_cache:
-            l["published"], l["pub_key"] = _pub_cache[l["url"]]
-    # Дату публикации со страницы лота берём только у РАД и МЭТС; у остальных есть дата начала приёма заявок
-    need = [l for l in top if not l.get("published") and l.get("src", "rad") in ("rad", "mets")]
-
-    def work(l):
-        try:
-            text, _ = fetch_detail_text(l["url"])
-            remember_pub(l, text)
-        except Exception as e:
-            log.error(f"Дата публикации {l['url']}: {e}")
-
-    _fetch_details(need, work, progress, "даты публикации")
+    add_pub_dates(top, progress)
     if sort == "new":
         top.sort(key=lambda l: (l.get("pub_key") or l.get("fresh_key") or (0,), l.get("code") or 0), reverse=True)
     found[:] = top + rest
@@ -1473,8 +1480,17 @@ def fmt_auto(lots, stats, q=None):
     if stats["not_opened"]:
         foot += f", не проверено (лимит): {stats['not_opened']}"
     if len(lots) > TOP_N:
-        foot += f"\nПоказаны первые {TOP_N} из {len(lots)}."
+        foot += f"\nПоказаны 1–{TOP_N} из {len(lots)}." + _more_hint(len(lots), TOP_N)
     return head + body + foot + "\n💡 /analyze N — подробнее о лоте N из последнего списка"
+
+
+def _more_hint(total, shown):
+    left = total - shown
+    if left <= 0:
+        return ""
+    if left <= TOP_N:
+        return f"\n👉 /more — остальные {left}"
+    return f"\n👉 /more — следующие {TOP_N} · /all — все оставшиеся ({left})"
 
 
 def fmt_realty(lots, stats, q=None):
@@ -1492,7 +1508,7 @@ def fmt_realty(lots, stats, q=None):
     if stats.get("excluded"):
         foot += "\nИсключено: " + ", ".join(f"{k} — {v}" for k, v in stats["excluded"].items())
     if len(lots) > TOP_N:
-        foot += f"\nПоказаны первые {TOP_N} из {len(lots)}."
+        foot += f"\nПоказаны 1–{TOP_N} из {len(lots)}." + _more_hint(len(lots), TOP_N)
     return head + body + foot + "\n💡 /analyze N — подробнее о лоте N из последнего списка"
 
 
@@ -1603,7 +1619,13 @@ def fmt_digest(lots, n=10):
 # ─── Chat IDs и состояние ─────────────────────────────
 
 LAST_LOTS = {}          # chat_id -> лоты последнего поиска (для /analyze)
+LAST_VIEW = {}          # chat_id -> что за список и сколько из него уже показано (для /more и /all)
 _busy, _busy_lock = set(), threading.Lock()
+
+
+def remember_list(cid, lots, kind, q):
+    LAST_LOTS[cid] = lots
+    LAST_VIEW[cid] = {"kind": kind, "title": describe_query(q), "shown": min(TOP_N, len(lots))}
 
 
 def load_chat_ids():
@@ -1661,6 +1683,8 @@ HELP_TEXT = (
     "Условия: год (2021), цена (до 2 млн), марка (kia), новые\n"
     "Пример: /auto kia 2021 до 2 млн\n\n"
     "<b>Другое</b>\n"
+    f"/more — следующие {TOP_N} лотов из последнего поиска\n"
+    "/all — все оставшиеся лоты сразу\n"
     "/analyze 3 — подробнее о лоте №3 из последнего списка\n"
     "/scan — общий поиск по всем категориям (только РАД)\n"
     "/categories — разделы площадок\n"
@@ -1678,7 +1702,7 @@ def cmd_auto(cid, args=()):
     lots, stats = search_auto(progress, q)
     progress("Сравниваю с объявлениями drom.ru…", force=True)
     add_drom_prices(lots)
-    LAST_LOTS[cid] = lots
+    remember_list(cid, lots, "auto", q)
     progress(f"✅ Готово за {int(time.time() - t0) // 60} мин {int(time.time() - t0) % 60} с", force=True)
     send_message(cid, fmt_auto(lots, stats, q))
 
@@ -1689,9 +1713,34 @@ def cmd_realty(cid, args=()):
     progress = Progress(cid, f"🏠 Ищу: {describe_query(q)}. "
                             "Это может занять несколько минут — ход поиска ниже.")
     lots, stats = search_realty(progress, q)
-    LAST_LOTS[cid] = lots
+    remember_list(cid, lots, "realty", q)
     progress(f"✅ Готово за {int(time.time() - t0) // 60} мин {int(time.time() - t0) % 60} с", force=True)
     send_message(cid, fmt_realty(lots, stats, q))
+
+
+def cmd_more(cid, show_all=False):
+    """Следующая порция лотов из последнего /auto или /realty (или все оставшиеся)."""
+    lots, view = LAST_LOTS.get(cid), LAST_VIEW.get(cid)
+    if not lots or not view:
+        answer(cid, "Сначала выполните поиск: /realty или /auto.")
+        return
+    start, total = view["shown"], len(lots)
+    if start >= total:
+        answer(cid, f"Это все лоты из последнего поиска ({total}). "
+                    "/analyze N — подробнее о лоте, /realty или /auto — новый поиск.")
+        return
+    end = total if show_all else min(start + TOP_N, total)
+    page = lots[start:end]
+    if pub_dates_needed(page):
+        progress = Progress(cid, f"Готовлю лоты {start + 1}–{end} из {total}…")
+        add_pub_dates(page, progress)
+        progress("✅ Готово", force=True)
+    view["shown"] = end
+    icon = "🚗" if view["kind"] == "auto" else "🏠"
+    head = f"{icon} <b>{esc(view['title'])}</b>\nЛоты {start + 1}–{end} из {total}\n\n"
+    body = "\n".join(fmt_simple(l, i, view["kind"]) for i, l in enumerate(page, start + 1))
+    foot = _more_hint(total, end) if end < total else "\n✅ Это все лоты из этого поиска."
+    send_message(cid, head + body + foot + "\n💡 /analyze N — подробнее о лоте N")
 
 
 def cmd_scan(cid, keyword):
@@ -1706,6 +1755,7 @@ def cmd_scan(cid, keyword):
         except Exception as e:
             log.error(f"Market analysis error: {e}")
     LAST_LOTS[cid] = analyzed
+    LAST_VIEW.pop(cid, None)
     msg = f"Результаты: «{esc(keyword)}»\n\n" if keyword else ""
     send_message(cid, msg + fmt_digest(analyzed, 10))
 
@@ -1865,6 +1915,11 @@ def handle_command(cid, text, user):
         run_exclusive(cid, lambda: cmd_scan(cid, " ".join(args) or None))
     elif cmd == "/analyze":
         run_exclusive(cid, lambda: cmd_analyze(cid, args))
+    elif cmd in ("/more", "/ещё", "/еще", "/дальше"):
+        show_all = bool(args) and args[0].lower() in ("все", "всё", "all")
+        run_exclusive(cid, lambda: cmd_more(cid, show_all))
+    elif cmd in ("/all", "/все", "/всё"):
+        run_exclusive(cid, lambda: cmd_more(cid, True))
     elif cmd == "/debug":
         run_exclusive(cid, lambda: cmd_debug(cid))
     else:
@@ -1881,18 +1936,18 @@ def do_daily():
             q = default_query("auto")
             lots, stats = search_auto(q=q)
             add_drom_prices(lots)
-            messages.append(("auto", lots, fmt_auto(lots, stats, q)))
+            messages.append(("auto", lots, q, fmt_auto(lots, stats, q)))
         if "realty" in kinds:
             q = default_query("realty")
             lots, stats = search_realty(q=q)
-            messages.append(("realty", lots, fmt_realty(lots, stats, q)))
+            messages.append(("realty", lots, q, fmt_realty(lots, stats, q)))
     except Exception as e:
         log.error(f"Daily error: {e}", exc_info=True)
     for cid in load_chat_ids():
         send_message(cid, "☀️ Утренний дайджест торгов")
-        for kind, lots, text in messages:
+        for kind, lots, q, text in messages:
             send_message(cid, text)
-            LAST_LOTS[cid] = lots
+            remember_list(cid, lots, kind, q)   # /more и /analyze относятся к последнему списку
 
 
 def scheduler():
@@ -1956,6 +2011,8 @@ def main():
     api_call("setMyCommands", commands=[
         {"command": "auto", "description": f"Авто от {AUTO_MIN_YEAR} г.в."},
         {"command": "realty", "description": "Недвижимость Москва и МО"},
+        {"command": "more", "description": "Следующие лоты из последнего поиска"},
+        {"command": "all", "description": "Все оставшиеся лоты из последнего поиска"},
         {"command": "analyze", "description": "Подробнее о лоте из списка"},
         {"command": "scan", "description": "Общий поиск по всем категориям"},
         {"command": "debug", "description": "Проверка чтения сайта"},
