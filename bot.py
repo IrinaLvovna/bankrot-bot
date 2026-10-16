@@ -58,13 +58,17 @@ SORT_DEFAULT = os.getenv("SORT_DEFAULT", "price")        # price — по цен
 REALTY_EXCLUDE = {x.strip() for x in os.getenv("REALTY_EXCLUDE", "lease,share,claim").split(",") if x.strip()}
 
 # Площадки: rad — lot-online.ru (РАД), mets — m-ets.ru (МЭТС)
-SOURCES = {x.strip().lower() for x in os.getenv("SOURCES", "rad,mets").split(",") if x.strip()}
+# Площадки: rad — lot-online.ru (РАД), mets — m-ets.ru (МЭТС), alfalot — Альфалот,
+# cdtrf — Центр дистанционных торгов, nistp — НИСТП
+SOURCES = {x.strip().lower() for x in os.getenv("SOURCES", "rad,mets,alfalot,cdtrf,nistp").split(",") if x.strip()}
+OTHER_MAX_PAGES = _env_int("OTHER_MAX_PAGES", 8)                 # страниц на Альфалоте, ЦДТ и НИСТП
 METS_AUTO_CATS = _env_ids("METS_AUTO_CATS", "1")                 # легковой автомобиль
 METS_REALTY_CATS = _env_ids("METS_REALTY_CATS", "36,34,37,39")   # квартира, жилой дом, нежилое помещение, прочие постройки
 METS_REGIONS = [str(x) for x in _env_ids("METS_REGIONS", "50,77")]       # для недвижимости: Московская обл., Москва
 METS_AUTO_REGIONS = [str(x) for x in _env_ids("METS_AUTO_REGIONS", "")]  # для авто: пусто — вся Россия
 METS_MAX_PAGES = _env_int("METS_MAX_PAGES", 10)                  # страниц поиска МЭТС на категорию (по 20 лотов)
-SRC_LABEL = {"rad": "РАД", "mets": "МЭТС"}
+SRC_ORDER = ("rad", "mets", "alfalot", "cdtrf", "nistp")
+SRC_LABEL = {"rad": "РАД", "mets": "МЭТС", "alfalot": "Альфалот", "cdtrf": "ЦДТ", "nistp": "НИСТП"}
 
 CUR_YEAR = datetime.now().year
 
@@ -300,7 +304,8 @@ class Progress:
 
 def fetch_category(cat_id, max_pages=None, progress=_noop):
     """Все лоты категории: листаем страницы, пока появляются новые."""
-    cat_name, cat_margin = RAD_CATEGORIES.get(cat_id, (f"Категория {cat_id}", 40))
+    site_name = _rad_site_cats.get(cat_id)
+    cat_name, cat_margin = RAD_CATEGORIES.get(cat_id, (site_name or f"Категория {cat_id}", 40))
     lots, seen = [], set()
     for page in range(1, (max_pages or MAX_PAGES) + 1):
         try:
@@ -323,6 +328,28 @@ def fetch_category(cat_id, max_pages=None, progress=_noop):
         if not new:
             break
     return lots
+
+
+_rad_site_cats = {}
+
+
+def rad_site_categories():
+    """Список разделов каталога РАД (id → название) из меню сайта. Загружается один раз."""
+    if not _rad_site_cats:
+        try:
+            doc = _doc(_get(_category_url(34, 1)).text)
+            for a in doc.xpath("//a[contains(@href, 'category_id=')]"):
+                m = re.search(r"category_id=(\d+)", a.get("href") or "")
+                name = _txt(a)
+                if m and name and len(name) < 80:
+                    _rad_site_cats.setdefault(int(m.group(1)), name)
+        except Exception as e:
+            log.error(f"Меню разделов РАД: {e}")
+    return _rad_site_cats
+
+
+def rad_cats_by_name(pattern):
+    return [cid for cid, name in rad_site_categories().items() if re.search(pattern, name, re.I)]
 
 
 def gather(cat_ids, progress=_noop):
@@ -391,22 +418,29 @@ def mets_search_url(filters, page=1):
     return f"{METS}/search?q={quote(q, safe='')}" + (f"&page={page}" if page > 1 else "")
 
 
-def mets_filters(kind, cat, sort):
+def mets_filters(kind, cat, q):
+    q = q or default_query(kind)
     f = {}
-    regions = METS_REGIONS if kind == "realty" else METS_AUTO_REGIONS
+    if kind == "realty":
+        regions = {"city": ["77"], "oblast": ["50"]}.get(q.get("region"), METS_REGIONS)
+    else:
+        regions = METS_AUTO_REGIONS
     if regions:
         f["xregion[]"] = regions
     f["search_category"] = str(cat)
-    if MIN_PRICE:
-        f["cena_tek_ot"] = str(MIN_PRICE)
-    if MAX_PRICE:
-        f["cena_tek_do"] = str(MAX_PRICE)
+    if kind == "auto" and q.get("words"):
+        f["lots"] = " ".join(q["words"])     # марка или модель — ищем прямо на сайте
+        f["lotst"] = "1"
+    if q.get("min_price"):
+        f["cena_tek_ot"] = str(q["min_price"])
+    if q.get("max_price"):
+        f["cena_tek_do"] = str(q["max_price"])
     if kind == "auto":
-        f["autoyear_ot"] = str(AUTO_MIN_YEAR)
+        f["autoyear_ot"] = str(q["min_year"])
     if kind == "realty" and "share" in REALTY_EXCLUDE:
         f["not_dolevoe"] = "on"
     f["stat[]"] = ["0", "1", "7"]          # объявлены, приём заявок, подача ценовых предложений
-    f["sortby"] = "1" if sort == "new" else "4"   # 1 — по дате публикации, 4 — сначала дешёвые
+    f["sortby"] = "1" if q["sort"] == "new" else "4"   # 1 — по дате публикации, 4 — сначала дешёвые
     return f
 
 
@@ -462,14 +496,14 @@ def _parse_mets_page(page_html, cat, kind):
     return lots
 
 
-def fetch_mets(kind, cats, sort, progress=_noop, errors=None):
+def fetch_mets(kind, cats, q, progress=_noop, errors=None):
     """Лоты МЭТС по категориям: фильтры региона, цены и года задаются прямо в поиске сайта."""
     lots, seen = [], set()
     for cat in cats:
         name = METS_CATEGORIES.get(cat, f"Категория {cat}")
         for page in range(1, METS_MAX_PAGES + 1):
             try:
-                r = _get(mets_search_url(mets_filters(kind, cat, sort), page))
+                r = _get(mets_search_url(mets_filters(kind, cat, q), page))
             except Exception as e:
                 log.error(f"  МЭТС {name} стр.{page}: {e}")
                 if errors is not None and page == 1:
@@ -496,25 +530,388 @@ def _error_reason(e):
     return type(e).__name__
 
 
-def gather_all(kind, rad_cats, mets_cats, sort, progress=_noop):
-    """Лоты с обеих площадок + сколько просмотрено на каждой и ошибки загрузки."""
-    errors, mets_errors = [], []
-    rad = gather(rad_cats, progress) if "rad" in SOURCES else []
-    mets = fetch_mets(kind, mets_cats, sort, progress, mets_errors) if "mets" in SOURCES else []
-    for reason in dict.fromkeys(mets_errors):
-        errors.append(f"МЭТС — {reason} (категорий: {mets_errors.count(reason)} из {len(mets_cats)})")
-    for l in rad:
-        l["kind"] = kind
-    by_src = {}
-    if "rad" in SOURCES:
-        by_src["РАД"] = len(rad)
-    if "mets" in SOURCES:
-        by_src["МЭТС"] = len(mets)
-    return rad + mets, by_src, errors
+def gather_all(kind, rad_cats, mets_cats, q, progress=_noop):
+    """Лоты со всех включённых площадок + сколько просмотрено на каждой и ошибки загрузки."""
+    fetchers = {
+        "rad": lambda errs: gather(rad_cats, progress),
+        "mets": lambda errs: fetch_mets(kind, mets_cats, q, progress, errs),
+        "alfalot": lambda errs: fetch_alfalot(kind, q, progress, errs),
+        "cdtrf": lambda errs: fetch_cdtrf(kind, q, progress, errs),
+        "nistp": lambda errs: fetch_nistp(kind, q, progress, errs),
+    }
+    all_lots, by_src, errors = [], {}, []
+    for src in SRC_ORDER:
+        if src not in SOURCES:
+            continue
+        errs = []
+        try:
+            lots = fetchers[src](errs)
+        except Exception as e:
+            log.error(f"{SRC_LABEL[src]}: {e}", exc_info=True)
+            errs.append(_error_reason(e))
+            lots = []
+        for l in lots:
+            l["kind"] = kind
+            l.setdefault("src", src)
+        all_lots += lots
+        by_src[SRC_LABEL[src]] = len(lots)
+        for reason in dict.fromkeys(errs):
+            extra = f" (категорий: {errs.count(reason)} из {len(mets_cats)})" if src == "mets" and len(mets_cats) > 1 else ""
+            errors.append(f"{SRC_LABEL[src]} — {reason}{extra}")
+    return all_lots, by_src, errors
 
 
 def _src_label(lot):
     return SRC_LABEL.get(lot.get("src", "rad"), "")
+
+# ─── Альфалот, ЦДТ, НИСТП ─────────────────────────────
+
+DEFAULT_REALTY_TYPES = ["flat", "house", "office", "garage"]
+EXTRA_CATS = {   # категории ЦДТ и Альфалота для типов недвижимости
+    "flat":     {"cdtrf": [21], "alfalot": [1]},
+    "house":    {"cdtrf": [22], "alfalot": [1]},
+    "office":   {"cdtrf": [31], "alfalot": [1]},
+    "building": {"cdtrf": [32, 33], "alfalot": [1]},
+    "garage":   {"cdtrf": [23], "alfalot": [1]},
+    "land":     {"cdtrf": [41], "alfalot": [7]},
+}
+JSON_HEADERS = {**HEADERS, "Accept": "application/json"}
+_OPEN_STATUS_BAD = re.compile(r"заверш|окончен|отмен|приостан|подведени|не состоял|определение участ|допущен", re.I)
+_PASSENGER_BODY = re.compile(r"седан|хэтчбек|хетчбек|универсал|купе|кабриолет|внедорож|кроссовер|лифтбек|минивэн|комби|пикап", re.I)
+_NOT_CAR = re.compile(r"грузов|самосвал|тягач|прицеп|автобус|фургон|спецтех|экскават|трактор|погрузч|автокран|кран\b|"
+                      r"мотоцикл|квадроцикл|снегоход|катер|лодк|бульдозер|каток", re.I)
+
+
+def _get_json(url, params=None, timeout=25):
+    r = requests.get(url, params=params, headers=JSON_HEADERS, timeout=timeout)
+    r.raise_for_status()
+    return r.json()
+
+
+def _parse_dt(s):
+    """'2026-11-23T12:00:00+03:00', '2026-10-19T10:00:00', '19.10.2026 10:00', '11/18/2026 11:00:00' → datetime."""
+    s = (s or "").strip()
+    if not s:
+        return None
+    try:
+        return datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except ValueError:
+        pass
+    for fmt in ("%d.%m.%Y %H:%M", "%d.%m.%Y", "%m/%d/%Y %H:%M:%S"):
+        try:
+            return datetime.strptime(s, fmt)
+        except ValueError:
+            pass
+    return None
+
+
+def _dt_key(dt):
+    return (dt.year, dt.month, dt.day, dt.hour, dt.minute) if dt else None
+
+
+def _days_left(dt):
+    if not dt:
+        return ""
+    today = datetime.now(ZoneInfo(TIMEZONE)).date()
+    days = (dt.date() - today).days
+    if days < 0:
+        return ""
+    return "сегодня" if days == 0 else f"через {days} дн."
+
+
+def realty_types_of(head):
+    """Тип недвижимости по началу описания лота (для площадок без своих категорий)."""
+    t = (head or "").lower().replace("ё", "е")
+    types = set()
+    if re.search(r"земельн\w*\s+участ|\bзем\.\s*участ|\bучаст(?:ок|ки)\b|\bземли\b", t):
+        types.add("land")
+    if re.search(r"гараж|машин\w*[- ]?мест|\bм/м\b|парковочн\w*\s+мест|\bпаркинг|\bгск\b|\bгк\s*«", t):
+        types.add("garage")
+    if re.search(r"нежил\w*\s+здани|\bздани[ея]\b|\bсооружени", t):
+        types.add("building")
+    if re.search(r"нежил\w*\s+помещ|\bофис|торгов\w*\s+помещ", t):
+        types.add("office")
+    t2 = re.sub(r"нежил\w*", " ", t)
+    if re.search(r"квартир|жил\w*\s+помещ|\bкомнат", t2):
+        types.add("flat")
+    if re.search(r"жил\w*\s+дом|^\W*дом\b|\bдом\s+(?:\d|площ|с\s+земел)|коттедж|домовлад|садов\w*\s+дом|"
+                 r"дачн\w*\s+дом|таунхаус", t2):
+        types.add("house")
+    return types
+
+
+def is_passenger_car(text, body=""):
+    t = (text or "").lower()
+    if re.search(r"легков", t) or _PASSENGER_BODY.search(body or ""):
+        return True
+    if _NOT_CAR.search(t):
+        return False
+    return bool(re.search(r"автомобил|\bавто\b", t))
+
+
+def _region_from(region_text, extra_text=""):
+    """(регион, подпись) по названию региона площадки; если его нет — по тексту лота."""
+    loc = (region_text or "").lower()
+    if not re.search(r"[а-я]", loc):
+        reg, label, _ = detect_region(extra_text)
+        return reg, label
+    if "москв" in loc or "московск" in loc:
+        reg, label, _ = detect_region(extra_text)
+        if "обл" in loc:
+            return "msk", (label if (reg == "msk" and label and label.startswith("Моск. обл.")) else "Московская обл.")
+        return "msk", (label if label == "Москва (Зеленоград)" else "Москва")
+    return "other", None
+
+
+def _realty_allowed(q):
+    return set(q.get("types") or DEFAULT_REALTY_TYPES)
+
+
+# Альфалот: витрина лотов отдаёт JSON
+ALFALOT_API = "https://ecosystem.alfalot.ru/api/showcase/lots/recommended/paginated"
+
+
+def fetch_alfalot(kind, q, progress=_noop, errors=None, max_pages=None):
+    if kind == "auto":
+        cats = [4]
+    else:
+        cats = sorted({c for t in _realty_allowed(q) for c in EXTRA_CATS[t]["alfalot"]})
+    params = {"per_page": 36, "categories": ",".join(map(str, cats)),
+              "status": "Прием заявок,Извещение опубликовано"}
+    if kind == "realty":
+        params["regions"] = {"city": "77", "oblast": "50"}.get(q.get("region"), "50,77")
+    elif METS_AUTO_REGIONS:
+        params["regions"] = ",".join(METS_AUTO_REGIONS)
+    if q.get("max_price"):
+        params["max_price"] = q["max_price"]
+    if q.get("min_price"):
+        params["min_price"] = q["min_price"]
+    if kind == "auto" and q.get("words"):
+        params["search"] = " ".join(q["words"])
+    if q["sort"] == "price" and kind == "realty":
+        params.update(sort="price", order="asc")
+    else:
+        params.update(sort="created_at", order="desc")   # сначала новые
+    allowed = _realty_allowed(q)
+    lots, seen = [], set()
+    for page in range(1, (max_pages or OTHER_MAX_PAGES) + 1):
+        try:
+            data = _get_json(ALFALOT_API, {**params, "page": page})
+        except Exception as e:
+            log.error(f"  Альфалот стр.{page}: {e}")
+            if errors is not None and page == 1:
+                errors.append(_error_reason(e))
+            break
+        items = data.get("lots") or []
+        new = 0
+        for it in items:
+            url = it.get("url") or ""
+            if not url or url in seen:
+                continue
+            seen.add(url)
+            new += 1
+            status = it.get("status") or ""
+            if _OPEN_STATUS_BAD.search(status):
+                continue
+            title = re.sub(r"\s+", " ", it.get("title") or "").strip()
+            ext = it.get("extension") or []
+            addr = " ".join(str((e.get("fields") or {}).get("field6") or "") for e in ext if e.get("type") == "rosreestr")
+            body = " ".join(str((e.get("fields") or {}).get("field5") or "") for e in ext if e.get("type") == "gibdd")
+            try:
+                price = float(it.get("current_price") or it.get("price") or 0)
+            except (TypeError, ValueError):
+                price = 0.0
+            if price <= 0 or not title:
+                continue
+            cat = it.get("category") or {}
+            cat_name = cat.get("title") or ""
+            if kind == "realty":
+                types = realty_types_of(title)
+                if not types & allowed:
+                    continue
+                cat_name = ", ".join(REALTY_TYPES[t][0] for t in REALTY_TYPES if t in types)
+            elif not is_passenger_car(title, body):
+                continue
+            start, end = _parse_dt(it.get("bid_start_date")), _parse_dt(it.get("bid_end_date"))
+            location = it.get("location") or ""
+            l = {"title": title, "card_text": f"{title} . {addr} . {location}", "price": price, "url": url,
+                 "cat_id": f"alfalot:{cat.get('id')}", "cat_name": cat_name, "cat_margin": 40,
+                 "date_end": _days_left(end), "code": int(it.get("auction_number") or 0), "src": "alfalot",
+                 "source": "alfalot.ru", "location": location if re.search(r"[А-Яа-я]", location) else "",
+                 "status": status, "fresh_key": _dt_key(start),
+                 "apps_from": start.strftime("%d.%m.%Y") if start else ""}
+            if kind == "realty":
+                l["region"], l["region_label"] = _region_from(location, f"{title} . {addr}")
+                l["region_src"] = "площадка"
+            lots.append(l)
+        log.info(f"  Альфалот стр.{page}: на странице {len(items)}, новых {new}")
+        progress(f"Альфалот: страница {page}, лотов {len(lots)}")
+        last = (data.get("pagination") or {}).get("last_page") or page
+        if not new or page >= last:
+            break
+    return lots
+
+
+# ЦДТ (Центр дистанционных торгов): список торгов отдаётся в JSON
+CDTRF = "https://torgi.cdtrf.ru"
+CDTRF_CATS = {1: "Легковой транспорт", 21: "Квартира", 22: "Жилой дом", 23: "Прочие постройки",
+              31: "Нежилое помещение", 32: "Нежилые здания", 33: "Прочие здания", 41: "Земельный участок"}
+
+
+def fetch_cdtrf(kind, q, progress=_noop, errors=None, max_pages=None):
+    if kind == "auto":
+        cats = [1]
+        regions = METS_AUTO_REGIONS
+    else:
+        cats = sorted({c for t in _realty_allowed(q) for c in EXTRA_CATS[t]["cdtrf"]})
+        regions = {"city": ["77"], "oblast": ["50"]}.get(q.get("region"), ["50", "77"])
+    params = [("Declare", "true"), ("RecieveReq", "true"), ("PageSize", "20"),
+              ("Categories", ",".join(map(str, cats)))]
+    if regions:
+        params.append(("RegionIds", ",".join(regions)))
+    if q.get("max_price"):
+        params.append(("CurrentPrice2", str(q["max_price"])))
+    if q.get("min_price"):
+        params.append(("CurrentPrice1", str(q["min_price"])))
+    if q["sort"] == "price" and kind == "realty":
+        params.append(("Sort", "ActualPrice"))   # иначе — сначала новые
+    lots, seen = [], set()
+    for page in range(1, (max_pages or OTHER_MAX_PAGES) + 1):
+        try:
+            data = _get_json(f"{CDTRF}/api/Trade/trades", params + [("PageNum", str(page))])
+        except Exception as e:
+            log.error(f"  ЦДТ стр.{page}: {e}")
+            if errors is not None and page == 1:
+                errors.append(_error_reason(e))
+            break
+        items = data.get("items") or []
+        new = 0
+        for it in items:
+            key = it.get("tradeLotId")
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            new += 1
+            status = it.get("tradeStatusDescription") or ""
+            if _OPEN_STATUS_BAD.search(status):
+                continue
+            title = re.sub(r"\s+", " ", it.get("name") or "").strip()
+            try:
+                price = float(it.get("actualPrice") or 0)
+            except (TypeError, ValueError):
+                price = 0.0
+            if price <= 0 or not title:
+                continue
+            lot_cats = [int(x) for x in re.findall(r"\d+", it.get("categories") or "")]
+            if lot_cats and not set(lot_cats) & set(cats):
+                continue
+            cat_name = next((CDTRF_CATS[c] for c in lot_cats if c in cats and c in CDTRF_CATS), "")
+            start, end = _parse_dt(it.get("requestTimeBegin")), _parse_dt(it.get("requestTimeEnd"))
+            rid = it.get("regionId")
+            l = {"title": title, "card_text": f"{title} . {cat_name}", "price": price,
+                 "url": f"{CDTRF}/trades/{it.get('tradeId')}", "cat_id": f"cdtrf:{','.join(map(str, lot_cats))}",
+                 "cat_name": cat_name, "cat_margin": 40, "date_end": _days_left(end), "code": int(key),
+                 "src": "cdtrf", "source": "torgi.cdtrf.ru", "status": status,
+                 "status_note": "действует минимальная цена" if it.get("isMinPrice") else "",
+                 "fresh_key": _dt_key(start), "apps_from": start.strftime("%d.%m.%Y") if start else "",
+                 "location": {77: "г. Москва", 50: "Московская область"}.get(rid, "")}
+            if kind == "realty":
+                region_text = {77: "г. Москва", 50: "Московская область"}.get(rid, "другой регион")
+                l["region"], l["region_label"] = _region_from(region_text, title)
+                l["region_src"] = "площадка"
+            lots.append(l)
+        log.info(f"  ЦДТ стр.{page}: на странице {len(items)}, новых {new}")
+        progress(f"ЦДТ: страница {page}, лотов {len(lots)}")
+        if not new or len(items) < 20:
+            break
+    return lots
+
+
+# НИСТП: список лотов (HTML), поиск по тексту описания; регион и цена — только в платной версии
+NISTP = "https://nistp.ru"
+
+
+def _parse_nistp_page(page_html, kind):
+    doc = _doc(page_html)
+    lots = []
+    for tr in doc.xpath("//tr[td and .//a[contains(@href, 'trade_view')]]"):
+        tds = tr.xpath("./td")
+        if len(tds) < 7:
+            continue
+        hrefs = [a.get("href") for a in tr.xpath(".//a[contains(@href, 'trade_view')]")]
+        url = next((h for h in hrefs if "#lot" in h), hrefs[-1])
+        if url.startswith("/"):
+            url = NISTP + url
+        # В ячейке: «Лот № N: краткое название <br> полное описание»
+        lot_a = next(iter(tr.xpath(".//a[contains(@href, '#lot')]")), None)
+        if lot_a is not None:
+            parts = re.split(r"<br\s*/?>", etree.tostring(lot_a, encoding="unicode", with_tail=False), maxsplit=1)
+            plain = [html.unescape(re.sub(r"<[^>]+>", " ", x)) for x in parts]
+            short = re.sub(r"^\s*Лот\s*№\s*\d+\s*:?", "", re.sub(r"\s+", " ", plain[0])).strip()
+            full = re.sub(r"\s+", " ", plain[1]).strip() if len(plain) > 1 else ""
+        else:
+            cell = _txt(tds[2])
+            m = re.search(r"Лот\s*№\s*(\d+)\s*:\s*(.*)", cell)
+            short, full = (m.group(2) if m else cell), ""
+        sep = ". . ." in short
+        short = short.replace(". . .", " ")
+        full = re.sub(r"\s*\.\s\.\s\.\s*$", "", full).strip(" .") or short
+        name = re.sub(r"\s+", " ", short).strip(" ,.")
+        if sep:                       # название обрезано сайтом — берём начало полного описания
+            title = _short(full, 150)
+        elif len(name) >= 25 or not full or full == name:
+            title = name
+        else:
+            title = _short(f"{name}. {full}", 150)
+        code_m = re.match(r"(\d+)", _txt(tds[0]))
+        start, end = _parse_dt(_txt(tds[4])), _parse_dt(_txt(tds[5]))
+        lots.append({
+            "title": title, "card_text": f"{name} . {full}", "price": parse_price(_txt(tds[3])), "url": url,
+            "cat_id": "nistp", "cat_name": "", "cat_margin": 40, "date_end": _days_left(end),
+            "code": int(code_m.group(1)) if code_m else 0, "src": "nistp", "source": "nistp.ru",
+            "status": _txt(tds[6]), "fresh_key": _dt_key(start),
+            "apps_from": start.strftime("%d.%m.%Y") if start else "", "head": f"{name} . {full[:150]}",
+        })
+    return lots
+
+
+def fetch_nistp(kind, q, progress=_noop, errors=None, max_pages=None):
+    desc = "автомобиль" if kind == "auto" else "Моск"
+    params = [("view_type", "lot"), ("lot_description", desc),
+              ("trade_state[]", "Торги объявлены"), ("trade_state[]", "Прием заявок")]
+    allowed = _realty_allowed(q)
+    lots, seen = [], set()
+    for page in range(1, (max_pages or OTHER_MAX_PAGES) + 1):
+        try:
+            r = requests.get(f"{NISTP}/bankrot/trade_list.php", params=params + [("pagenum", page)],
+                             headers=HEADERS, timeout=25)
+            r.raise_for_status()
+        except Exception as e:
+            log.error(f"  НИСТП стр.{page}: {e}")
+            if errors is not None and page == 1:
+                errors.append(_error_reason(e))
+            break
+        page_lots = _parse_nistp_page(r.text, kind)
+        new = [l for l in page_lots if l["url"] not in seen]
+        seen.update(l["url"] for l in new)
+        for l in new:
+            if l["price"] <= 0 or _OPEN_STATUS_BAD.search(l["status"]):
+                continue
+            if kind == "realty":
+                types = realty_types_of(l["head"])
+                if not types & allowed:
+                    continue
+                l["cat_name"] = ", ".join(REALTY_TYPES[t][0] for t in REALTY_TYPES if t in types)
+                reg, label, src = detect_region(l["card_text"])
+                l["region"], l["region_label"], l["region_src"] = reg, label, ("текст" if src == "текст" else "адрес")
+            elif not is_passenger_car(l["head"]):
+                continue
+            lots.append(l)
+        log.info(f"  НИСТП стр.{page}: на странице {len(page_lots)}, новых {len(new)}")
+        progress(f"НИСТП: страница {page}, лотов {len(lots)}")
+        if not new:
+            break
+    return lots
 
 # ─── Год выпуска ───────────────────────────────────────
 
@@ -702,13 +1099,130 @@ def remember_pub(l, text):
         _pub_cache[l["url"]] = pub
 
 
+# ─── Параметры поиска из команды ──────────────────────
+# Примеры: «/realty квартиры москва до 8 млн новые», «/auto kia 2021 до 2 млн»
+
+REALTY_TYPES = {
+    # ключ: (подпись, разделы РАД, категории МЭТС, слова в команде)
+    "flat":    ("квартиры", [34], [36], r"\bкварт\w*"),
+    "house":   ("дома", [38], [34], r"\b(?:дом|дома|домов|домик\w*|коттедж\w*|дач\w*)\b"),
+    "office":  ("нежилые помещения", [23], [37], r"\bнежил\w*|\bпомещ\w*|\bофис\w*|\bкоммерч\w*"),
+    "building": ("здания", [22], [38], r"\bздани\w*"),
+    "garage":  ("гаражи и машино-места", [26], [39], r"\bгараж\w*|\bмашин\w*[- ]?мест\w*|\bпаркинг\w*"),
+    "land":    ("земельные участки", "land", [11], r"\bучаст\w*|\bземл\w*|\bземел\w*"),
+}
+_SORT_NEW_RE = re.compile(r"\b(?:нов\w*|свеж\w*|дат\w*|new)\b")
+_SORT_PRICE_RE = re.compile(r"\b(?:цен\w*|дешев\w*|price)\b")
+_REG_OBL_RE = re.compile(r"\bобласт\w*|\bмо\b|\bподмосков\w*")
+_REG_CITY_RE = re.compile(r"\bмосква\b|\bмоскве\b|\bмск\b")
+_YEAR_ARG_RE = re.compile(r"(?:\b(?:с|от|после)\s*)?\b(19[89]\d|20[0-3]\d)\b(?:\s*(?:г\.?\s?в\.?|года?|гв|г\.))?"
+                          r"(?!\s*(?:млн|тыс|т\b|к\b|руб|₽|р\b))")
+_PRICE_ARG_RE = re.compile(r"\b(до|от)\s*(\d+(?:[.,]\d+)?(?:\s\d{3})*)\s*"
+                           r"(млн\w*|миллион\w*|м\b|тыс\w*|т\.?р\.?|т\b|к\b|k\b|руб\w*|р\b|₽)?")
+_STOP_WORDS = {"все", "лоты", "лот", "руб", "рублей", "млн", "тыс", "года", "год", "для", "без", "или"}
+
+
+def default_query(kind):
+    return {"kind": kind, "sort": "new" if SORT_DEFAULT.lower().startswith("new") else "price",
+            "types": None, "min_price": MIN_PRICE, "max_price": MAX_PRICE,
+            "min_year": AUTO_MIN_YEAR, "region": None, "words": []}
+
+
+def parse_query(args, kind):
+    """Разбирает слова после команды: тип объекта, цена, год, регион, сортировка, слова для поиска."""
+    q = default_query(kind)
+    t = " " + " ".join(args).lower().replace("ё", "е") + " "
+    if _SORT_NEW_RE.search(t):
+        q["sort"] = "new"
+    elif _SORT_PRICE_RE.search(t):
+        q["sort"] = "price"
+    t = _SORT_PRICE_RE.sub(" ", _SORT_NEW_RE.sub(" ", t))
+    if kind == "auto":
+        m = _YEAR_ARG_RE.search(t)
+        if m:
+            q["min_year"] = int(m.group(1))
+            t = t[:m.start()] + " " + t[m.end():]
+    for m in list(_PRICE_ARG_RE.finditer(t)):
+        num = float(re.sub(r"\s", "", m.group(2)).replace(",", "."))
+        unit = (m.group(3) or "").lower()
+        if unit.startswith(("млн", "миллион", "м")):
+            num *= 1_000_000
+        elif unit.startswith(("тыс", "т", "к", "k")):
+            num *= 1_000
+        elif not unit.startswith(("руб", "р", "₽")) and num < 1000:
+            num *= 1_000_000          # «до 5» — считаем, что это миллионы
+        q["max_price" if m.group(1) == "до" else "min_price"] = int(num)
+    t = _PRICE_ARG_RE.sub(" ", t)
+    if kind == "realty":
+        types = [k for k, v in REALTY_TYPES.items() if re.search(v[3], t)]
+        if types:
+            q["types"] = types
+        for v in REALTY_TYPES.values():
+            t = re.sub(v[3], " ", t)
+        if _REG_OBL_RE.search(t):
+            q["region"] = "oblast"
+        elif _REG_CITY_RE.search(t):
+            q["region"] = "city"
+        t = _REG_CITY_RE.sub(" ", _REG_OBL_RE.sub(" ", t))
+    q["words"] = [w for w in re.findall(r"[a-zа-я0-9][a-zа-я0-9-]{2,}", t) if w not in _STOP_WORDS]
+    return q
+
+
 def parse_sort(args):
-    a = " ".join(args).lower()
-    if any(w in a for w in ("нов", "дат", "свеж", "new")):
-        return "new"
-    if any(w in a for w in ("цен", "дешев", "дёшев", "price")):
-        return "price"
-    return "new" if SORT_DEFAULT.lower().startswith("new") else "price"
+    return parse_query(args, "auto")["sort"]
+
+
+def realty_cats(q):
+    """Разделы РАД и категории МЭТС для выбранных типов недвижимости."""
+    if not q.get("types"):
+        return REALTY_CATS, METS_REALTY_CATS, []
+    rad, mets, notes = [], [], []
+    for key in q["types"]:
+        label, rad_ids, mets_ids, _ = REALTY_TYPES[key]
+        if rad_ids == "land":
+            found = rad_cats_by_name(r"земел|земл")
+            if not found and "rad" in SOURCES:
+                notes.append("РАД — раздел с земельными участками не найден на сайте")
+            rad_ids = found
+        rad += [c for c in rad_ids if c not in rad]
+        mets += [c for c in mets_ids if c not in mets]
+    return rad, mets, notes
+
+
+def _region_ok(l, q):
+    if not q.get("region"):
+        return True
+    city = (l.get("region_label") or "").startswith("Москва")
+    return city if q["region"] == "city" else not city
+
+
+def _words_ok(l, q):
+    if not q.get("words"):
+        return True
+    hay = " ".join([l.get("title", ""), l.get("card_text", ""), l.get("region_label") or "",
+                    l.get("location") or ""]).lower().replace("ё", "е")
+    return all(w in hay for w in q["words"])
+
+
+def describe_query(q):
+    """Короткая строка с условиями поиска для заголовка списка."""
+    parts = []
+    if q["kind"] == "realty":
+        what = ", ".join(REALTY_TYPES[k][0] for k in q["types"]) if q.get("types") else "недвижимость"
+        where = {"city": "Москва", "oblast": "Московская обл."}.get(q.get("region"), "Москва и Московская обл.")
+        parts.append(f"{what[:1].upper()}{what[1:]}: {where}")
+    else:
+        parts.append(f"Авто от {q['min_year']} г.в.")
+    price = []
+    if q.get("min_price"):
+        price.append(f"от {rub(q['min_price'])}")
+    if q.get("max_price"):
+        price.append(f"до {rub(q['max_price'])}")
+    if price:
+        parts.append(" ".join(price))
+    if q.get("words"):
+        parts.append("«" + " ".join(q["words"]) + "»")
+    return ", ".join(parts)
 
 
 def order_lots(found, sort, progress=_noop):
@@ -717,9 +1231,9 @@ def order_lots(found, sort, progress=_noop):
         # Номера лотов растут со временем, но у каждой площадки свои — берём самые свежие с каждой,
         # узнаём даты публикации и уже по ним сортируем вместе
         top, ids = [], set()
-        for src in ("rad", "mets"):
+        for src in SRC_ORDER:
             part = sorted((l for l in found if l.get("src", "rad") == src),
-                          key=lambda l: (-(l.get("code") or 0), l["price"]))
+                          key=lambda l: (l.get("fresh_key") or (0,), l.get("code") or 0), reverse=True)
             top += part[:TOP_N]
         ids = {id(l) for l in top}
         rest = sorted((l for l in found if id(l) not in ids), key=lambda l: -(l.get("code") or 0))
@@ -729,7 +1243,8 @@ def order_lots(found, sort, progress=_noop):
     for l in top:
         if not l.get("published") and l["url"] in _pub_cache:
             l["published"], l["pub_key"] = _pub_cache[l["url"]]
-    need = [l for l in top if not l.get("published")]
+    # Дату публикации со страницы лота берём только у РАД и МЭТС; у остальных есть дата начала приёма заявок
+    need = [l for l in top if not l.get("published") and l.get("src", "rad") in ("rad", "mets")]
 
     def work(l):
         try:
@@ -740,7 +1255,7 @@ def order_lots(found, sort, progress=_noop):
 
     _fetch_details(need, work, progress, "даты публикации")
     if sort == "new":
-        top.sort(key=lambda l: (l.get("pub_key") or (0,), l.get("code") or 0), reverse=True)
+        top.sort(key=lambda l: (l.get("pub_key") or l.get("fresh_key") or (0,), l.get("code") or 0), reverse=True)
     found[:] = top + rest
     return found
 
@@ -752,7 +1267,8 @@ _EXCLUDE_RULES = {
     "lease": ("право аренды", re.compile(_LOT_PREFIX + r"(?:прав[оа]|уступк\w*\s+прав\w*)\s+(?:\w+\s+){0,2}аренд")),
     # «Доля в праве 1/18…», «1/2 доли в праве на квартиру», «…(1/3 доли)»
     "share": ("доли в праве", re.compile(_LOT_PREFIX + r"дол[яиюе]\b|\d+\s*/\s*\d+\s*(?:дол|доли)|"
-                                          r"\bдол[яиюе]\s+(?:в\s+праве|в\s+общей|в\s+размере)")),
+                                          r"\bдол(?:я|и|ю|е|ей)\s+(?:\d|в\s+(?:праве|общей|размере|земельн|"
+                                          r"квартир|жил|нежил|доме|ооо|уставн))|\bторги\s+долей\b")),
     "claim": ("права требования", re.compile(r"прав[оа]\s+(?:\w+\s+){0,2}требовани|дебиторск\w*\s+задолж|"
                                              r"уступк\w*\s+прав\w*\s+требовани")),
     "storage": ("кладовые", re.compile(r"кладов|хозблок|хозяйственн\w*\s+блок")),
@@ -773,8 +1289,8 @@ _year_cache = {}     # url -> список годов из карточки ло
 _region_cache = {}   # url -> (регион, подпись, источник)
 
 
-def _price_ok(l):
-    return MIN_PRICE <= l["price"] <= MAX_PRICE
+def _price_ok(l, q):
+    return (q.get("min_price") or 0) <= l["price"] <= (q.get("max_price") or float("inf"))
 
 
 def _fetch_details(lots, worker, progress=_noop, what="карточки лотов"):
@@ -794,9 +1310,10 @@ def _fetch_details(lots, worker, progress=_noop, what="карточки лото
     return len(lots)
 
 
-def search_auto(progress=_noop, sort="price"):
-    all_lots, by_src, errors = gather_all("auto", AUTO_CATS, METS_AUTO_CATS, sort, progress)
-    lots = [l for l in all_lots if _price_ok(l)]
+def search_auto(progress=_noop, q=None):
+    q = q or default_query("auto")
+    all_lots, by_src, errors = gather_all("auto", AUTO_CATS, METS_AUTO_CATS, q, progress)
+    lots = [l for l in all_lots if _price_ok(l, q) and _words_ok(l, q)]
     need = []
     for l in lots:
         years = extract_years(l["title"], allow_bare=True) or extract_years(l["card_text"])
@@ -817,8 +1334,8 @@ def search_auto(progress=_noop, sort="price"):
         _year_cache[l["url"]] = l["years"]
 
     opened = _fetch_details(need, work, progress, "лоты без года в названии")
-    found = [l for l in lots if l["years"] and l["years"][-1] >= AUTO_MIN_YEAR]
-    order_lots(found, sort, progress)
+    found = [l for l in lots if l["years"] and l["years"][-1] >= q["min_year"]]
+    order_lots(found, q["sort"], progress)
     stats = {"total": len(all_lots), "in_price": len(lots), "opened": opened,
              "not_opened": max(0, len(need) - opened),
              "no_year": sum(1 for l in lots if not l["years"]),
@@ -826,9 +1343,11 @@ def search_auto(progress=_noop, sort="price"):
     return found, stats
 
 
-def search_realty(progress=_noop, sort="price"):
-    all_lots, by_src, errors = gather_all("realty", REALTY_CATS, METS_REALTY_CATS, sort, progress)
-    in_price = [l for l in all_lots if _price_ok(l)]
+def search_realty(progress=_noop, q=None):
+    q = q or default_query("realty")
+    rad_cats, mets_cats, notes = realty_cats(q)
+    all_lots, by_src, errors = gather_all("realty", rad_cats, mets_cats, q, progress)
+    in_price = [l for l in all_lots if _price_ok(l, q)]
     lots, excluded = [], {}
     for l in in_price:
         why = excluded_reason(l["title"])
@@ -840,18 +1359,12 @@ def search_realty(progress=_noop, sort="price"):
     for l in lots:
         if l.get("src") == "mets":
             # У МЭТС регион — отдельное поле «Регион местонахождения имущества»
-            loc = (l.get("location") or "").lower()
-            if "москв" in loc or "московск" in loc:
-                # Город для подписи берём из названия и описания, если он там указан
-                reg, label, _ = detect_region(l["card_text"])
-                if "обл" in loc:
-                    label = label if (reg == "msk" and label and label.startswith("Моск. обл.")) else "Московская обл."
-                else:
-                    label = label if label == "Москва (Зеленоград)" else "Москва"
-                l["region"], l["region_label"], l["region_src"] = "msk", label, "МЭТС"
-            else:
-                l["region"], l["region_label"], l["region_src"] = ("other" if loc else None), None, "МЭТС"
+            loc = l.get("location") or ""
+            reg, label = _region_from(loc, l["card_text"]) if loc else (None, None)
+            l["region"], l["region_label"], l["region_src"] = reg, label, "МЭТС"
             continue
+        if l.get("src", "rad") != "rad":
+            continue          # Альфалот, ЦДТ, НИСТП — регион уже определён при загрузке
         if l["url"] in _region_cache:
             l["region"], l["region_label"], l["region_src"] = _region_cache[l["url"]]
             continue
@@ -874,12 +1387,12 @@ def search_realty(progress=_noop, sort="price"):
         _region_cache[l["url"]] = (reg, label, src)
 
     opened = _fetch_details(need, work, progress, "лоты без адреса в названии")
-    found = [l for l in lots if l.get("region") == "msk"]
-    order_lots(found, sort, progress)
+    found = [l for l in lots if l.get("region") == "msk" and _region_ok(l, q) and _words_ok(l, q)]
+    order_lots(found, q["sort"], progress)
     stats = {"total": len(all_lots), "in_price": len(in_price), "opened": opened,
              "not_opened": max(0, len(need) - opened),
              "unknown": sum(1 for l in lots if not l.get("region")),
-             "excluded": excluded, "by_src": by_src, "errors": errors}
+             "excluded": excluded, "by_src": by_src, "errors": errors, "notes": notes}
     return found, stats
 
 
@@ -900,7 +1413,7 @@ def fmt_simple(lot, i, kind):
     parts = [f"💰 <b>{rub(lot['price'])}</b>"]
     if kind == "auto" and lot.get("years"):
         parts.append(f"📅 {year_label(lot['years'])}")
-    if kind == "auto" and lot.get("src") == "mets" and lot.get("location"):
+    if kind == "auto" and lot.get("src", "rad") != "rad" and lot.get("location"):
         parts.append(f"📍 {esc(lot['location'])}")
     if kind == "realty":
         if lot.get("region_label"):
@@ -913,6 +1426,8 @@ def fmt_simple(lot, i, kind):
         parts.append(f"📉 мин. {rub(lot['min_price'])}")
     if lot.get("published"):
         parts.append(f"📢 опубл. {lot['published']}")
+    elif lot.get("apps_from"):
+        parts.append(f"📝 заявки с {lot['apps_from']}")
     if lot.get("date_end"):
         parts.append(f"⏳ торги {esc(lot['date_end'])}")
     if _src_label(lot):
@@ -936,16 +1451,19 @@ def _sources_line(stats):
         f"\nПросмотрено лотов: {stats['total']}"
     for e in stats.get("errors") or []:
         line += f"\n⚠️ Не удалось загрузить {esc(e)}"
+    for n in stats.get("notes") or []:
+        line += f"\n⚠️ {esc(n)}"
     return line
 
 
 def _sources_title():
-    return " + ".join(SRC_LABEL[s] for s in ("rad", "mets") if s in SOURCES)
+    return " + ".join(SRC_LABEL[s] for s in SRC_ORDER if s in SOURCES)
 
 
-def fmt_auto(lots, stats, sort="price"):
-    head = (f"🚗 <b>Авто от {AUTO_MIN_YEAR} г.в., до {rub(MAX_PRICE)}</b> · {_sources_title()}\n"
-            f"Найдено: <b>{len(lots)}</b> · {_sort_label(sort)}\n")
+def fmt_auto(lots, stats, q=None):
+    q = q or default_query("auto")
+    head = (f"🚗 <b>{esc(describe_query(q))}</b> · {_sources_title()}\n"
+            f"Найдено: <b>{len(lots)}</b> · {_sort_label(q['sort'])}\n")
     if not lots:
         body = "\nПодходящих лотов сейчас нет.\n"
     else:
@@ -959,9 +1477,10 @@ def fmt_auto(lots, stats, sort="price"):
     return head + body + foot + "\n💡 /analyze N — подробнее о лоте N из последнего списка"
 
 
-def fmt_realty(lots, stats, sort="price"):
-    head = (f"🏠 <b>Недвижимость: Москва и Московская обл., до {rub(MAX_PRICE)}</b> · {_sources_title()}\n"
-            f"Найдено: <b>{len(lots)}</b> · {_sort_label(sort)}\n")
+def fmt_realty(lots, stats, q=None):
+    q = q or default_query("realty")
+    head = (f"🏠 <b>{esc(describe_query(q))}</b> · {_sources_title()}\n"
+            f"Найдено: <b>{len(lots)}</b> · {_sort_label(q['sort'])}\n")
     if not lots:
         body = "\nПодходящих лотов сейчас нет.\n"
     else:
@@ -1056,6 +1575,12 @@ def fmt_lot_full(lot, i):
         msg += f"\nКатегория: {esc(lot['cat_name'])}"
     if lot.get("status"):
         msg += f"\nСтатус: {esc(lot['status'])}"
+    if lot.get("status_note"):
+        msg += f" ({esc(lot['status_note'])})"
+    if lot.get("published"):
+        msg += f"\nОпубликовано: {lot['published']}"
+    elif lot.get("apps_from"):
+        msg += f"\nПриём заявок с {lot['apps_from']}"
     if lot.get("date_end"):
         msg += f"\nОкончание: {esc(lot['date_end'])}"
     if _src_label(lot):
@@ -1117,43 +1642,56 @@ def run_exclusive(cid, fn):
 # ─── Команды ───────────────────────────────────────────
 
 HELP_TEXT = (
-    "<b>Бот банкротских торгов (РАД lot-online.ru + МЭТС m-ets.ru)</b>\n\n"
-    f"/auto — легковые авто от {AUTO_MIN_YEAR} г.в., до {rub(MAX_PRICE)}\n"
-    f"/realty — недвижимость в Москве и МО, до {rub(MAX_PRICE)}\n"
-    "/auto новые, /realty новые — сначала свежие лоты\n"
-    "/auto цена, /realty цена — сначала дешёвые\n"
+    "<b>Бот банкротских торгов</b>\nПлощадки: РАД, МЭТС, Альфалот, ЦДТ, НИСТП\n\n"
+    "<b>Недвижимость в Москве и МО</b>\n"
+    "/realty — квартиры, дома, нежилые, гаражи\n"
+    "После команды можно добавить условия в любом порядке:\n"
+    "• тип: квартиры, дома, участки, нежилые, здания, гаражи\n"
+    "• где: москва или область\n"
+    "• цена: до 8 млн, от 500 тыс\n"
+    "• порядок: новые или цена\n"
+    "• любое слово из описания: одинцово, химки…\n"
+    "Примеры:\n"
+    "/realty квартиры\n"
+    "/realty дома участки область до 5 млн\n"
+    "/realty квартиры москва новые\n"
+    "/realty одинцово\n\n"
+    "<b>Авто</b>\n"
+    f"/auto — легковые от {AUTO_MIN_YEAR} г.в., до {rub(MAX_PRICE)}\n"
+    "Условия: год (2021), цена (до 2 млн), марка (kia), новые\n"
+    "Пример: /auto kia 2021 до 2 млн\n\n"
+    "<b>Другое</b>\n"
     "/analyze 3 — подробнее о лоте №3 из последнего списка\n"
     "/scan — общий поиск по всем категориям (только РАД)\n"
-    "/scan слово — поиск по слову\n"
-    "/categories — список категорий\n"
-    "/debug — проверка чтения сайта\n\n"
+    "/categories — разделы площадок\n"
+    "/debug — проверка чтения сайтов\n\n"
     "Поиск занимает несколько минут, ход виден в сообщении бота.\n"
     f"Утренняя рассылка: {DAILY_HOUR:02d}:{DAILY_MINUTE:02d} МСК"
 )
 
 
 def cmd_auto(cid, args=()):
-    sort = parse_sort(args)
+    q = parse_query(args, "auto")
     t0 = time.time()
-    progress = Progress(cid, f"🚗 Ищу авто от {AUTO_MIN_YEAR} г.в. до {rub(MAX_PRICE)}. "
+    progress = Progress(cid, f"🚗 Ищу: {describe_query(q)}. "
                             "Это может занять несколько минут — ход поиска ниже.")
-    lots, stats = search_auto(progress, sort)
+    lots, stats = search_auto(progress, q)
     progress("Сравниваю с объявлениями drom.ru…", force=True)
     add_drom_prices(lots)
     LAST_LOTS[cid] = lots
     progress(f"✅ Готово за {int(time.time() - t0) // 60} мин {int(time.time() - t0) % 60} с", force=True)
-    send_message(cid, fmt_auto(lots, stats, sort))
+    send_message(cid, fmt_auto(lots, stats, q))
 
 
 def cmd_realty(cid, args=()):
-    sort = parse_sort(args)
+    q = parse_query(args, "realty")
     t0 = time.time()
-    progress = Progress(cid, f"🏠 Ищу недвижимость в Москве и МО до {rub(MAX_PRICE)}. "
+    progress = Progress(cid, f"🏠 Ищу: {describe_query(q)}. "
                             "Это может занять несколько минут — ход поиска ниже.")
-    lots, stats = search_realty(progress, sort)
+    lots, stats = search_realty(progress, q)
     LAST_LOTS[cid] = lots
     progress(f"✅ Готово за {int(time.time() - t0) // 60} мин {int(time.time() - t0) % 60} с", force=True)
-    send_message(cid, fmt_realty(lots, stats, sort))
+    send_message(cid, fmt_realty(lots, stats, q))
 
 
 def cmd_scan(cid, keyword):
@@ -1268,7 +1806,7 @@ def cmd_debug(cid):
             name = METS_CATEGORIES.get(cat, str(cat))
             log.info(f"debug: МЭТС {name}")
             try:
-                r = _get(mets_search_url(mets_filters(kind, cat, "price")))
+                r = _get(mets_search_url(mets_filters(kind, cat, default_query(kind))))
                 lots = _parse_mets_page(r.text, cat, kind)
                 out.append(f"{name}: ответ {r.status_code}, {len(r.text) // 1024} КБ, лотов на стр.1: {len(lots)}")
                 for l in lots[:3]:
@@ -1277,6 +1815,25 @@ def cmd_debug(cid):
                     out.append(f" • {_short(l['title'], 80)} | {rub(l['price'])} | {extra} | {_short(l['status'], 40)}")
             except Exception as e:
                 out.append(f"{name}: ошибка — {_short(str(e), 200)}")
+        out.append("")
+    for src, fn in (("alfalot", fetch_alfalot), ("cdtrf", fetch_cdtrf), ("nistp", fetch_nistp)):
+        if src not in SOURCES:
+            continue
+        log.info(f"debug: {SRC_LABEL[src]}")
+        for kind in ("realty", "auto"):
+            errs = []
+            try:
+                lots = fn(kind, default_query(kind), errors=errs, max_pages=1)
+            except Exception as e:
+                errs.append(_short(str(e), 150))
+                lots = []
+            what = "недвижимость" if kind == "realty" else "авто"
+            out.append(f"🏛 {SRC_LABEL[src]}, {what}: отобрано на стр.1 — {len(lots)}"
+                       + (f"; ошибка: {errs[0]}" if errs else ""))
+            for l in lots[:2]:
+                extra = (l.get("region_label") or l.get("region") or "—") if kind == "realty" else \
+                    (year_label(extract_years(l["title"], True) or extract_years(l["card_text"])) or "год —")
+                out.append(f" • {_short(l['title'], 70)} | {rub(l['price'])} | {extra}")
         out.append("")
     log.info(f"debug: отправляю отчёт ({sum(len(x) for x in out)} симв.)")
     send_message(cid, "\n".join(out), parse_mode=None)
@@ -1291,9 +1848,14 @@ def handle_command(cid, text, user):
     if cmd in ("/start", "/help"):
         answer(cid, HELP_TEXT)
     elif cmd == "/categories":
-        lines = ["<b>Категории на РАД:</b>\n"]
-        lines += [f"  {cat_id}: {name}" for cat_id, (name, _) in sorted(RAD_CATEGORIES.items())]
-        lines.append(f"\nАвто: {AUTO_CATS} · Недвижимость: {REALTY_CATS}")
+        lines = ["<b>Типы недвижимости для /realty:</b>"]
+        lines += [f"  {v[0]}" for v in REALTY_TYPES.values()]
+        lines.append("\n<b>Разделы РАД:</b>")
+        lines += [f"  {cat_id}: {esc(name)}" for cat_id, (name, _) in sorted(RAD_CATEGORIES.items())]
+        land = rad_cats_by_name(r"земел|земл")
+        lines.append(f"  Земельные участки на сайте: {land or 'не найдены'}")
+        lines.append("\n<b>Категории МЭТС:</b>")
+        lines += [f"  {cat_id}: {name}" for cat_id, name in sorted(METS_CATEGORIES.items())]
         answer(cid, "\n".join(lines))
     elif cmd == "/auto":
         run_exclusive(cid, lambda: cmd_auto(cid, args))
@@ -1316,14 +1878,14 @@ def do_daily():
     messages = []
     try:
         if "auto" in kinds:
-            sort = parse_sort([])
-            lots, stats = search_auto(sort=sort)
+            q = default_query("auto")
+            lots, stats = search_auto(q=q)
             add_drom_prices(lots)
-            messages.append(("auto", lots, fmt_auto(lots, stats, sort)))
+            messages.append(("auto", lots, fmt_auto(lots, stats, q)))
         if "realty" in kinds:
-            sort = parse_sort([])
-            lots, stats = search_realty(sort=sort)
-            messages.append(("realty", lots, fmt_realty(lots, stats, sort)))
+            q = default_query("realty")
+            lots, stats = search_realty(q=q)
+            messages.append(("realty", lots, fmt_realty(lots, stats, q)))
     except Exception as e:
         log.error(f"Daily error: {e}", exc_info=True)
     for cid in load_chat_ids():
